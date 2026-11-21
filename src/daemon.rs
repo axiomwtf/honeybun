@@ -215,6 +215,49 @@ pub fn serve() {
     // the V8 isolate, later runs reuse it (module cache included).
     let runtime = crate::runtime::Runtime::new_warm();
 
+    // Prewarm the test-worker pool in the background so the first `honey
+    // test` after a cold daemon start finds hot engines instead of paying
+    // the engine-init spawn per chunk. Knob: HONEY_TEST_PREWARM (count,
+    // default 4, "0" disables; always capped by HONEY_TEST_MAX_IDLE).
+    if test_pool_enabled() {
+        std::thread::Builder::new()
+            .name("pool-prewarm".into())
+            .spawn(|| {
+                let count = std::env::var("HONEY_TEST_PREWARM")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(4)
+                    .min(test_pool_max_idle());
+                let mut spawned = 0usize;
+                for _ in 0..count {
+                    match TestWorker::spawn() {
+                        Ok(w) => {
+                            let pushed = TEST_POOL
+                                .try_lock()
+                                .map(|mut p| {
+                                    if p.len() >= test_pool_max_idle() {
+                                        false
+                                    } else {
+                                        p.push(w);
+                                        true
+                                    }
+                                })
+                                .unwrap_or(false);
+                            if !pushed {
+                                break; // w dropped here: killed + reaped
+                            }
+                            spawned += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if spawned > 0 {
+                    trace_log(&format!("pool: prewarmed {spawned} workers"));
+                }
+            })
+            .ok();
+    }
+
     for stream in listener.incoming() {
         trace_log("accepted connection");
         let Ok(mut stream) = stream else { continue };
@@ -744,7 +787,10 @@ fn serve_test_batch_parallel(req: Request, chunks: usize) -> TestBatchResponse {
 // Knobs: HONEY_TEST_POOL (max live workers; "0" disables the pool entirely
 // and restores one-shot workers), HONEY_TEST_MAX_IDLE (idle workers retained
 // between batches, default 8 to match the chunk cap — a hot pool makes every
-// batch after the first spawn-free; idle engines measured ~22MB each).
+// batch after the first spawn-free; idle engines measured ~22MB each),
+// HONEY_TEST_PREWARM (workers pre-spawned at daemon start, default 4, "0"
+// disables — the daemon starts them in the background so the first
+// `honey test` after a cold daemon never pays the engine-init spawn).
 
 static TEST_POOL: std::sync::Mutex<Vec<TestWorker>> = std::sync::Mutex::new(Vec::new());
 
@@ -937,45 +983,23 @@ fn handle_run(request: &Request, runtime: &crate::runtime::Runtime) -> Response 
         let _ = std::env::set_current_dir(&request.cwd);
     }
 
-    // A preload (test shim) is materialized as a wrapper module that runs the
-    // shim first and then loads the main module itself, so both share one
-    // engine. The wrapper lives in the system temp dir (nothing transient is
-    // ever written into a user project) and is removed after the run.
-    let (file, wrapper) = if request.preload.is_empty() {
-        (request.file.clone(), None)
+    // A preload (test shim) runs with the main module loaded by the wrapper
+    // itself — the wrapper source executes INLINE in the engine (see
+    // runtime::run_preload), so nothing transient is ever written to disk.
+    let outcome = if request.preload.is_empty() {
+        runtime.run_file(&request.file, &request.args)
     } else {
-        match write_wrapper_file(&request.preload) {
-            Ok(p) => (p.to_string_lossy().into_owned(), Some(p)),
-            Err(e) => {
-                return Response {
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    duration_ms: started.elapsed().as_secs_f64() * 1000.0,
-                    error: Some(format!("failed to write test wrapper: {e:#}")),
-                    file: None,
-                }
-            }
+        // V2 test preloads run under the engine-registered harness: make sure
+        // the shim is inside whichever engine run_preload lands on.
+        if request.preload.starts_with(crate::runtime::TEST_SHIM_MARKER) {
+            crate::runtime::request_test_shim();
         }
+        runtime.run_preload(&request.file, &request.preload, &request.args)
     };
-
-    // V2 test preloads run under the engine-registered harness: make sure
-    // the shim is inside whichever engine run_file lands on.
-    if !request.preload.is_empty() && request.preload.starts_with(crate::runtime::TEST_SHIM_MARKER) {
-        crate::runtime::request_test_shim();
-    }
-
-    let mut error = None;
-    let exit_code = match runtime.run_file(&file, &request.args) {
-        Ok(code) => code,
-        Err(e) => {
-            error = Some(format!("{e:#}"));
-            1
-        }
+    let (exit_code, error) = match outcome {
+        Ok(code) => (code, None),
+        Err(e) => (1, Some(format!("{e:#}"))),
     };
-    if let Some(p) = wrapper {
-        let _ = std::fs::remove_file(p);
-    }
     trace_log(&format!("run done code={exit_code} t={:?}", started.elapsed()));
 
     Response {
@@ -986,19 +1010,6 @@ fn handle_run(request: &Request, runtime: &crate::runtime::Runtime) -> Response 
         error,
         file: None,
     }
-}
-
-/// A unique temp file for one preload wrapper module.
-fn write_wrapper_file(source: &str) -> Result<std::path::PathBuf> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let name = format!(
-        "honey-preload-{}-{}.js",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    let path = std::env::temp_dir().join(name);
-    std::fs::write(&path, source).context("failed to write preload wrapper")?;
-    Ok(path)
 }
 
 fn fail_response(error: String) -> Response {

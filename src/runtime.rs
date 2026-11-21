@@ -20,6 +20,10 @@ thread_local! {
     static WARM_ENGINE_HAS_MAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Monotonic counter for synthetic inline-preload script/module names (one
+/// per executed preload; uniqueness only aids debugging traces).
+static PRELOAD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Record an uncaught main-level error so the run ends with exit code 1.
 /// `process.exit()` sentinel exceptions are ignored (handled as exit codes).
 fn record_uncaught(text: &str) {
@@ -132,6 +136,148 @@ impl Runtime {
             MODULE_RESOLUTIONS.with(|c| c.borrow_mut().clear());
         }
         result
+    }
+
+    /// Run one test file with the preload shim wrapper executed INLINE — no
+    /// temp wrapper file is ever written to disk.
+    pub fn run_preload(&self, main_file: &str, preload: &str, args: &[String]) -> Result<i32> {
+        let path = Path::new(main_file);
+        if !path.exists() {
+            anyhow::bail!("file not found: {}", main_file);
+        }
+        // Set args so process.argv points at the REAL main module, exactly
+        // like the wrapper-file path did.
+        ARGS.with(|a| {
+            let mut v = a.borrow_mut();
+            v.clear();
+            v.push("honey".to_string());
+            v.push(main_file.to_string());
+            v.extend(args.iter().cloned());
+        });
+
+        let full_path = std::env::current_dir()
+            .context("failed to get current directory")?
+            .join(main_file);
+        let is_esm_wrapper = preload.contains("export {};");
+
+        let (runtime, result) = match self.warm.take() {
+            Some(rt) if !WARM_ENGINE_HAS_MAIN.with(|f| f.get()) => {
+                let mut rt = rt;
+                warm_prepare(&mut rt, &full_path);
+                self.execute_preload(main_file, preload, is_esm_wrapper, rt)
+            }
+            warm_or_none => {
+                drop(warm_or_none);
+                let rt = build_runtime();
+                self.execute_preload(main_file, preload, is_esm_wrapper, rt)
+            }
+        };
+
+        if self.keep_alive && matches!(&result, Ok(0)) {
+            self.warm.set(Some(runtime));
+        } else {
+            drop(runtime);
+            MODULE_CACHE.with(|c| c.borrow_mut().clear());
+            MODULE_RESOLUTIONS.with(|c| c.borrow_mut().clear());
+        }
+        result
+    }
+
+    fn execute_preload(
+        &self,
+        main_file: &str,
+        preload: &str,
+        esm_wrapper: bool,
+        mut runtime: JsRuntime,
+    ) -> (JsRuntime, Result<i32>) {
+        // Register the test harness in THIS engine before the wrapper runs
+        // (same rule as execute_script; the pending request was set by the
+        // daemon when the V2-marked preload was seen).
+        execute_pending_test_shim(&mut runtime);
+        let full_path = std::env::current_dir()
+            .map(|c| c.join(main_file))
+            .unwrap_or_else(|_| std::env::temp_dir().join(main_file));
+        // Anchor relative requires inside the wrapper to the main file's
+        // directory (the wrapper itself only uses absolute specifiers).
+        MODULE_DIR.with(|d| {
+            *d.borrow_mut() = full_path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+        });
+
+        let outcome: Result<(), anyhow::Error> = if esm_wrapper {
+            // ESM wrapper: a synthetic specifier main module (nothing on
+            // disk). Relative imports from the wrapper would resolve against
+            // this scheme, but its loader step uses the absolute main path.
+            let seq = PRELOAD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let specifier = match ModuleSpecifier::parse(&format!("honey:preload/{seq}")) {
+                Ok(s) => s,
+                Err(e) => return (runtime, Err(anyhow::anyhow!("bad preload specifier: {e}"))),
+            };
+            WARM_ENGINE_HAS_MAIN.with(|f| f.set(true));
+            (|| -> anyhow::Result<()> {
+                let id = block_on(runtime.load_main_es_module_from_code(&specifier, preload.to_owned()))
+                    .map_err(|e| anyhow::anyhow!("failed to load test wrapper: {e}"))?;
+                let _ = runtime.mod_evaluate(id);
+                if let Err(e) = block_on(runtime.run_event_loop(Default::default())) {
+                    let msg = format!("{e}");
+                    if msg.contains("__honey_exit__") {
+                        if let Some(code) = take_exit_request() {
+                            use std::io::Write as _;
+                            let _ = std::io::stdout().flush();
+                            let _ = std::io::stderr().flush();
+                            return Ok(()); // exit_code handled below
+                        }
+                    }
+                    anyhow::bail!("event loop failed: {e:#}");
+                }
+                Ok(())
+            })()
+        } else {
+            // CJS wrapper: evaluate the wrapper source as a plain script in
+            // the warm engine. It references the global `require` (absolute
+            // main path) and leaves nothing behind but the harness state.
+            (|| -> anyhow::Result<()> {
+                runtime
+                    .execute_script("honey:preload", preload.to_owned())
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                if let Err(e) = block_on(runtime.run_event_loop(Default::default())) {
+                    anyhow::bail!("event loop failed: {e:#}");
+                }
+                Ok(())
+            })()
+        };
+
+        // Shared tail: forced exits, uncaught errors, process.exitCode.
+        if let Some(code) = take_exit_request() {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            return (runtime, Ok(code));
+        }
+        if let Err(e) = outcome {
+            return (runtime, Err(e));
+        }
+        if let Some(_uncaught) = UNCAUGHT_ERROR.with(|u| u.borrow_mut().take()) {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            return (runtime, Ok(1));
+        }
+        let exit_code = {
+            let mut scope = runtime.handle_scope();
+            let context = scope.get_current_context();
+            let global = context.global(&mut scope);
+            let pk = v8::String::new(&mut scope, "process").unwrap();
+            global
+                .get(&mut scope, pk.into())
+                .and_then(|v| v.to_object(&mut scope))
+                .and_then(|p| {
+                    let ek = v8::String::new(&mut scope, "exitCode").unwrap();
+                    p.get(&mut scope, ek.into())
+                })
+                .and_then(|v| v.int32_value(&mut scope))
+                .unwrap_or(0)
+        };
+        (runtime, Ok(exit_code))
     }
 
     /// Evaluate a JS string in the retained warm engine (creating one if
