@@ -348,22 +348,21 @@ honey test --watch         # watch mode
 
 ### Measurement conditions
 
-Benchmarks are taken on the real target class of hardware — an 8GB RAM i5-13420H laptop — at ~75% RAM utilization, under everyday load: browser open with media streaming while scrolling. Not on an idle benchmark rig. All measurements use the standard `cargo build --release` binary with default profile flags (opt-level 3, LTO, strip) — no PGO, no custom tuning. A quiet dedicated machine only improves the ratios; a laptop under real-world memory and multitask pressure is where the dev loop actually lives, so that is where the ~11x nominal and up-to-11.5x peak are claimed from.
+Benchmarks are taken on the real target class of hardware — an 8GB RAM i5-13420H laptop — at ~75% RAM utilization, under everyday load: browser open with media streaming while scrolling. Not on an idle benchmark rig. All measurements use the standard `cargo build --release` binary with default profile flags (opt-level 3, LTO, strip) — no PGO, no custom tuning. A quiet dedicated machine only improves the ratios; a laptop under real-world memory and multitask pressure is where the dev loop actually lives, so that is where the ~5.7x nominal and up-to-6x peak are claimed from (2026-11-21 battery; node ratios peak at 22.4x, claimed as up-to-23x).
 
 | Operation | vs Bun |
 |-----------|--------|
-| Dev loop (repeated invocations, warm daemon) | ~11x nominal (5-6x single-run, fork/exec-floor capped; 7-13.6x on batched work) |
-| Test/batch runs (vitest-style suites, warm runner) | up to 11.5x faster (200-file suite: honey mean 2.3ms vs Bun 24.6ms = 10.7x mean, 11.4x best = 50-module batch in the 2026-11-21 battery) |
-| Per-file spawns (fresh process per file, warm daemon) | 4.4-8.9x faster (grows with suite size: 200 files, honey 264-340ms vs Bun 2.1-2.3s = 6.9-8.1x) |
-| Watch mode (edit-refresh cycle) | 5-11x faster (edit→output vs `bun --watch`: honey 5.5-9ms vs Bun 22-64ms under load; re-run itself ~1ms on the warm engine, event-driven inotify, no polling) |
-| Node startup-bound workloads | up to 100x faster |
-| Parse | 1.5x faster |
-| Transpile (TS to JS) | 1.5x faster |
-| Bundle | ~1:1 (`honey build <entry> [-o dir]`: inlines relative imports and — since the standard `node_modules` fallback — bare npm packages too, resolved via package.json `exports`/`main` from `.cinm` or `node_modules`; CSS imports are extracted to a sibling `.css` (minified in production); a `process` guard is emitted for browser bundles; `node:` builtins and URL specs stay external; no tree-shake yet) |
-| Install | ~1:1 |
+| Dev loop (repeated invocations, warm daemon) | 5.7x single-run (warm `honey run hello.js` 1.60ms vs `bun hello.js` 9.19ms), 2.1x batched (50-module batch: 5.13 vs 10.89ms), 4.6x on TS (1.90 vs 8.81ms) — 2026-11-21 battery medians |
+| Test/batch runs (vitest-style suites, warm runner) | 1.2x faster (50 files / 150 assertions: honey 14.0 vs Bun 16.5ms median — and the cold-start first run is fully prewarmed by the daemon's background pool) |
+| Per-file spawns (fresh process per file, warm daemon) | 1.8x faster (50 files: honey 256.6ms vs Bun 454.9ms) |
+| Watch mode (edit-refresh cycle) | 2.2x faster (edit→output vs `bun --watch`: honey ~7.2ms vs Bun ~15.8ms warm; re-run itself ~1ms on the warm engine, event-driven inotify, no polling) |
+| Node startup-bound workloads | up to 23x faster (warm JS run: honey 1.60ms vs Node 35.85ms) |
+| Transpile (TS to JS) | 2.9x faster (1.3MB TS: 17.4 vs 50.3ms) |
+| Bundle | 3.6x faster dev (2.77 vs 9.86ms, 100 modules + CSS; `honey build <entry> [-o dir]`: inlines relative imports and — since the standard `node_modules` fallback — bare npm packages too, resolved via package.json `exports`/`main` from `.cinm` or `node_modules`; CSS imports are extracted to a sibling `.css` (minified in production); a `process` guard is emitted for browser bundles; `node:` builtins and URL specs stay external; no tree-shake yet) |
+| Install | ~1:1 (network-bound: 268 vs 287ms, 3 tiny packages) |
 | Type-checking | Not supported (use tsc) |
-| Minify | ~parity-class (oxc codegen minify + `process.env.NODE_ENV` define with static-if/dead-branch elimination to a fixpoint; a real axiom-scale app bundles 1.9 MB dev → 548 KB `--production`, with dev-only react modules dropped from the graph). Tree-shaking (used-export analysis) is tracked, not landed. |
-| Sourcemaps | oxc per-module maps concatenated at bundle line offsets — `--sourcemap linked` (default unminified), `external` (default with `--minify`/`-p`), `inline`, or `none`; tokens map back to original TS/JS lines/columns |
+| Minify | 2.8x faster (3.44 vs 9.69ms, 100-module bundle; oxc codegen minify + `process.env.NODE_ENV` define with static-if/dead-branch elimination to a fixpoint; a real axiom-scale app bundles 1.9 MB dev → 548 KB `--production`, with dev-only react modules dropped from the graph; `-p` prod build 2.75ms). Tree-shaking (used-export analysis) is tracked, not landed. |
+| Sourcemaps | 3.2x faster external (2.81 vs 9.07ms, 100 modules; per-module oxc maps concatenated at bundle line offsets) — `--sourcemap linked` (default unminified), `external` (default with `--minify`/`-p`), `inline`, or `none`; tokens map back to original TS/JS lines/columns |
 
 Reference points behind the dev-loop row: a two-line `console.log` script runs in ~113µs median end-to-end through the warm daemon (Bun: ~590µs on the same machine, same session); a `require('ms')`-style node_modules-resolution script runs in ~114µs (Bun: ~623µs); a warm `require()` to an already-cached module costs 2-3µs. Behind the batch row: 50 vitest-style test files where Bun pays its per-file runtime startup 50 times and honey's warm daemon pays it once; warm staleness re-validation is one mtime check per cached file (~0.6µs each). Fresh engine creation init is 1.30ms with the startup context snapshot vs 3.56ms without (§6).
 
@@ -398,5 +397,5 @@ Optional, for the fastest possible engine init (§6): after the first build, run
 - No Bun code. No Zig. Forked deno (deno_core + deno_node, fully optimized). Clean room.
 - The compiler is written in Rust (edition 2024) and lives in `src/`
 - The daemon is the single biggest architectural decision in the whole project
-- Every `honey run` in the dev loop is an IPC round-trip (~0.2ms on top of a ~90µs process floor) instead of a cold runtime start. That's the up-to-11.5x claim on batched and watch workloads.
-- Axiom philosophy ("no sidecars: companion files and helper processes count as bugs"): the daemon is the one permitted helper process, justified by the up-to-11.5x dev-loop claim. Its socket lives in `$XDG_RUNTIME_DIR` (user tmpfs), is chmod 0600, and is removed on daemon exit. Nothing transient is ever written into a user project: only project data (`.cinm/`, `honey.lock`), like Cargo.lock. Transient helper files (hxney's exec wrapper) go to the system temp dir.
+- Every `honey run` in the dev loop is an IPC round-trip (~0.2ms on top of a ~90µs process floor) instead of a cold runtime start. That's the up-to-6x claim on single-run and watch workloads.
+- Axiom philosophy ("no sidecars: companion files and helper processes count as bugs"): the daemon is the one permitted helper process, justified by the up-to-6x dev-loop claim. Its socket lives in `$XDG_RUNTIME_DIR` (user tmpfs), is chmod 0600, and is removed on daemon exit. Nothing transient is ever written into a user project: only project data (`.cinm/`, `honey.lock`), like Cargo.lock. Transient helper files (hxney's exec wrapper) go to the system temp dir.

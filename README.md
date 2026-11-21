@@ -4,7 +4,7 @@
 
 # honeybun
 
-**Up to 11.5x faster than Bun. Up to 100x faster than Node. One binary. One toolchain.**
+**Up to 6x faster than Bun. Up to 23x faster than Node. One binary. One toolchain.**
 
 honeybun is a single static binary that provides equivalent functionality to npm, npx, esbuild, vite, and vitest in one toolchain, plus TypeScript-to-JavaScript transpilation. It is Node-compatible, TypeScript-native, scriptable, and faster on the dev loop due to a persistent daemon architecture. It is not a tsc replacement: TypeScript is transpiled with the Oxc parser + transformer, no full type-checking is performed (use tsc for that). honeybun is owned by AXIOM.
 
@@ -182,17 +182,16 @@ Measured on the actual target hardware: an 8GB RAM i5-13420H laptop, at ~75% RAM
 
 | Operation | vs Bun |
 |-----------|--------|
-| Dev loop (repeated invocations, warm daemon) | ~11x nominal (5-6x single-run, fork/exec-floor capped; 7-13.6x on batched work) |
-| Test/batch runs (vitest-style suites, warm runner) | up to 11.5x faster (200-file suite: honey mean 2.3ms vs Bun 24.6ms = 10.7x mean, 11.4x best = 50-module batch in the 2026-11-21 battery) |
-| Per-file spawns (fresh process per file, warm daemon) | 4.4-8.9x faster (grows with suite size: 200 files, honey 264-340ms vs Bun 2.1-2.3s = 6.9-8.1x) |
-| Watch mode (edit-refresh cycle) | 5-11x faster (edit→output vs `bun --watch`: honey 5.5-9ms vs Bun 22-64ms under load; re-run itself ~1ms on the warm engine, event-driven inotify, no polling) |
-| Node startup-bound workloads | up to 100x faster |
-| Parse | 1.5x faster |
-| Transpile (TS to JS) | 1.5x faster |
-| Bundle | ~1:1 (`honey build <entry> [-o dir]`: inlines relative imports and bare npm packages (exports/main via `.cinm` or standard `node_modules`), extracts CSS imports to a sibling `.css`, emits a browser-safe `process` guard; `node:*` stays external; no tree-shake yet) |
-| Minify | oxc codegen minify + NODE_ENV define with dead-branch elimination (`-p`/`--minify`; axiom-scale app: 1.9 MB → 548 KB, dev-only react modules dropped) |
-| Sourcemaps | per-module oxc maps merged at bundle line offsets; `--sourcemap linked|external|inline|none` (linked default unminified, external default with `-p`) |
-| Install | ~1:1 |
+| Dev loop (repeated invocations, warm daemon) | 5.7x single-run (warm `honey run hello.js` 1.60ms vs `bun hello.js` 9.19ms), 2.1x batched (50-module batch: 5.13 vs 10.89ms), 4.6x on TS (1.90 vs 8.81ms) — 2026-11-21 battery medians |
+| Test/batch runs (vitest-style suites, warm runner) | 1.2x faster (50 files / 150 assertions: honey 14.0 vs Bun 16.5ms median — and the cold-start first run is fully prewarmed by the daemon's background pool) |
+| Per-file spawns (fresh process per file, warm daemon) | 1.8x faster (50 files: honey 256.6ms vs Bun 454.9ms) |
+| Watch mode (edit-refresh cycle) | 2.2x faster (edit→output vs `bun --watch`: honey ~7.2ms vs Bun ~15.8ms warm; re-run itself ~1ms on the warm engine, event-driven inotify, no polling) |
+| Node startup-bound workloads | up to 23x faster (warm JS run: honey 1.60ms vs Node 35.85ms) |
+| Transpile (TS to JS) | 2.9x faster (1.3MB TS: 17.4 vs 50.3ms) |
+| Bundle | 3.6x faster dev (100 modules + CSS: 2.77 vs 9.86ms; `honey build <entry> [-o dir]`: inlines relative imports and bare npm packages (exports/main via `.cinm` or standard `node_modules`), extracts CSS imports to a sibling `.css`, emits a browser-safe `process` guard; `node:*` stays external; no tree-shake yet) |
+| Minify | 2.8x faster (100-module bundle: 3.44 vs 9.69ms; oxc codegen minify + NODE_ENV define with dead-branch elimination (`-p`/`--minify`; prod build 2.75ms)) |
+| Sourcemaps | 3.2x faster external (2.81 vs 9.07ms; per-module oxc maps merged at bundle line offsets; `--sourcemap linked|external|inline|none` (linked default unminified, external default with `-p`)) |
+| Install | ~1:1 (network-bound: 268 vs 287ms, 3 tiny packages) |
 | Type-checking | Not supported (use tsc) |
 | Minify | Tracking (custom Cinnamon minifier) |
 

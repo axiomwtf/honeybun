@@ -6,7 +6,7 @@ use honey::{PackageManager, Runtime};
 #[command(name = "honey")]
 #[command(author = "AXIOM")]
 #[command(version = "0.1.0")]
-#[command(about = "Up to 11.5x faster than Bun. Up to 100x faster than Node. One binary. One toolchain.", long_about = None)]
+#[command(about = "Up to 6x faster than Bun. Up to 23x faster than Node. One binary. One toolchain.", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
