@@ -416,7 +416,11 @@ impl Runtime {
                         // Engine spent: discard it entirely and rebuild.
                         // esm_warm_done stays false, so the ordinary main
                         // path below runs on the fresh engine.
+                        // v8 150+ requires isolates to drop in reverse
+                        // creation order, so the spent isolate must exit
+                        // BEFORE the fresh one enters.
                         let t_re = std::time::Instant::now();
+                        drop(runtime);
                         let fresh = build_runtime();
                         self.engine_has_main.set(false);
                         runtime = fresh;
@@ -587,15 +591,18 @@ pub fn snapshot_active() -> bool {
 /// init times. Used to A/B the startup snapshot within one binary.
 pub fn engine_init_timing(n: usize) {
     for i in 0..n {
+        // Each engine lives in its own block: v8 150+ requires isolates to
+        // drop in reverse creation order, so engine i must be GONE before
+        // engine i+1's isolate is constructed.
         let t0 = std::time::Instant::now();
-        let mut rt = {
-            let j = build_runtime();
-            j
+        let elapsed = {
+            let mut rt = build_runtime();
+            // Load a trivial script so lazy context portions materialize.
+            let _ = rt.execute_script("honey:timing", "1+1".to_owned()).ok();
+            t0.elapsed()
         };
-        // Load a trivial script so lazy context portions materialize.
-        let _ = rt.execute_script("honey:timing", "1+1".to_owned()).ok();
         if i == 0 || n <= 10 {
-            eprintln!("engine init {}: {:?}", i, t0.elapsed());
+            eprintln!("engine init {}: {:?}", i, elapsed);
         }
     }
 }

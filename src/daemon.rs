@@ -200,16 +200,99 @@ fn read_msg<S: std::io::Read + ?Sized>(stream: &mut S) -> Option<Vec<u8>> {
 // ---------- daemon loop ----------
 
 /// Entry point for `honey --internal-daemon`. Never returns while serving.
+// ---------- engine threads ----------
+// One retained engine per dedicated thread, for the engine's whole lifetime.
+// v8 150+ enters the isolate at construction, checks Isolate::GetCurrent()
+// at every ContextScope creation and requires reverse-creation-order drops —
+// two retained engines sharing the accept thread made any `run` after a
+// `test` batch panic ("Context do not belong to the same Isolate") and kill
+// the daemon. The accept thread still blocks on each reply, so execution
+// stays serialized exactly as before.
+
+/// A one-command job for the run-engine thread. `eval` selects config-hook
+/// evaluation (handle_eval) instead of a file run (handle_run); the reply
+/// carries the final Response with stdout/stderr already captured.
+struct RunJob {
+    req: Request,
+    eval: bool,
+    reply: std::sync::mpsc::Sender<Response>,
+}
+
+struct TestJob {
+    req: Request,
+    reply: std::sync::mpsc::Sender<TestBatchResponse>,
+}
+
+/// Send a job to a run-engine worker and wait for its Response. None when
+/// the worker died (channel hangup): callers synthesize a failure reply.
+fn on_run_engine(
+    tx: &std::sync::mpsc::Sender<RunJob>,
+    req: Request,
+    eval: bool,
+) -> Option<Response> {
+    let (rtx, rrx) = std::sync::mpsc::channel();
+    tx.send(RunJob { req, eval, reply: rtx }).ok()?;
+    rrx.recv().ok()
+}
+
+fn spawn_run_engine() -> std::sync::mpsc::Sender<RunJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<RunJob>();
+    let _ = std::thread::Builder::new().name("honey-run-engine".into()).spawn(
+        move || {
+            let runtime = crate::runtime::Runtime::new_warm();
+            while let Ok(job) = rx.recv() {
+                let RunJob { req, eval, reply } = job;
+                let (out, err, mut response) = if eval {
+                    capture_stdio(|| handle_eval(&req, &runtime))
+                } else {
+                    capture_stdio(|| handle_run(&req, &runtime))
+                };
+                response.stdout = out;
+                response.stderr = err;
+                let _ = reply.send(response);
+            }
+        },
+    );
+    tx
+}
+
+fn spawn_test_engine() -> std::sync::mpsc::Sender<TestJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<TestJob>();
+    let _ = std::thread::Builder::new().name("honey-test-engine".into()).spawn(
+        move || {
+            // A dedicated retained engine for test batches: `run` requests
+            // load an ESM main into their engine, which makes it un-reusable
+            // for the next preload run (deno_core: one main module per
+            // engine) — if tests shared that engine, every batch would pay a
+            // full engine rebuild on its first file. Its own thread keeps it
+            // main-free (CJS-shaped preloads) and reused forever.
+            let test_runtime = crate::runtime::Runtime::new_warm();
+            while let Ok(job) = rx.recv() {
+                let TestJob { req, reply } = job;
+                let _ = reply.send(serve_test_batch(req, &test_runtime));
+            }
+        },
+    );
+    tx
+}
+
 pub fn serve() {
     // A daemon crash used to be invisible (stderr nulled) and surfaced only
     // as a mysterious ~1s client stall + respawn. Log panics to disk.
     std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
         let msg = format!(
-            "[{}] honey daemon panic: {info}\n",
+            "[{}] honey daemon panic at {location}: {info}\n{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            // Always carry a captured backtrace: the daemon's stderr may be
+            // nulled and RUST_BACKTRACE may be unset in spawned daemons.
+            std::backtrace::Backtrace::force_capture()
         );
         if let Some(f) = daemon_stderr_log() {
             if let Some(dir) = f.parent() {
@@ -293,16 +376,15 @@ pub fn serve() {
     // clients would block forever behind it.
     drop(_guard);
 
-    // One warm engine for the whole daemon lifetime: first request builds
-    // the V8 isolate, later runs reuse it (module cache included).
-    let runtime = crate::runtime::Runtime::new_warm();
-    // A SECOND retained engine dedicated to test batches. `run` requests
-    // load an ESM main into their engine, which makes it un-reusable for
-    // the next preload run (deno_core: one main module per engine) — if
-    // tests shared that engine, every batch would pay a full engine
-    // rebuild on its first file. With a dedicated slot the test engine
-    // stays main-free (CJS-shaped preloads) and is reused forever.
-    let test_runtime = crate::runtime::Runtime::new_warm();
+    // One warm engine per dedicated thread, for the engine's whole lifetime.
+    // v8 150+ enters the isolate at construction, checks Isolate::GetCurrent()
+    // at every ContextScope creation and requires reverse-creation-order
+    // drops — two retained engines sharing the accept thread made any `run`
+    // after a `test` batch panic ("Context do not belong to the same
+    // Isolate") and killed the daemon. The accept thread still blocks on
+    // each reply, so execution stays serialized exactly as before.
+    let run_tx = spawn_run_engine();
+    let test_tx = spawn_test_engine();
 
     // Prewarm the test-worker pool in the background so the first `honey
     // test` after a cold daemon start finds hot engines instead of paying
@@ -429,7 +511,20 @@ pub fn serve() {
                 // file (pristine per-file globals); small batches stay in
                 // the single warm engine.
                 let req = request.clone();
-                let out_body = serve_test_batch(req, &test_runtime);
+                let out_body = (|| {
+                    let (rtx, rrx) = std::sync::mpsc::channel();
+                    test_tx
+                        .send(TestJob { req, reply: rtx })
+                        .ok()
+                        .and_then(|_| rrx.recv().ok())
+                })()
+                .unwrap_or(TestBatchResponse {
+                    results: vec![Response {
+                        exit_code: 1,
+                        error: Some("test engine unavailable".into()),
+                        ..Default::default()
+                    }],
+                });
                 let _ = write_msg(&mut stream, &out_body);
             }
             "run" if !request.preload.is_empty() => {
@@ -460,12 +555,16 @@ pub fn serve() {
             }
             "run" => {
                 let req = request.clone();
-                let rt = &runtime;
-                trace_log("run: entering capture_stdio");
-                let (out, err, mut response) = capture_stdio(move || handle_run(&req, rt));
-                trace_log("run: capture done");
-                response.stdout = out;
-                response.stderr = err;
+                trace_log("run: dispatching to run engine");
+                let response = on_run_engine(&run_tx, req, false).unwrap_or(Response {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    duration_ms: 0.0,
+                    error: Some("run engine unavailable".into()),
+                    file: None,
+                });
+                trace_log("run: engine returned");
                 let _ = write_msg(&mut stream, &response);
                 trace_log("run: response written");
             }
@@ -479,16 +578,20 @@ pub fn serve() {
             }
             "watch" => {
                 trace_log("watch: session opened");
-                watch_session(&mut stream, &request, &runtime);
+                watch_session(&mut stream, &request, &run_tx);
                 trace_log("watch: session closed");
             }
             "eval" => {
                 // Config hook evaluation: pure script in the warm engine.
                 let req = request.clone();
-                let rt = &runtime;
-                let (out, err, mut response) = capture_stdio(move || handle_eval(&req, rt));
-                response.stdout = out;
-                response.stderr = err;
+                let response = on_run_engine(&run_tx, req, true).unwrap_or(Response {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    duration_ms: 0.0,
+                    error: Some("run engine unavailable".into()),
+                    file: None,
+                });
                 let _ = write_msg(&mut stream, &response);
             }
             _ => {}
@@ -1779,7 +1882,11 @@ fn abs_main_path(request: &Request) -> String {
 /// events via inotify (no polling), re-run on the warm engine, repeat. Any
 /// events that arrive mid-run are consumed by the post-run drain, so one
 /// editor save yields exactly one re-run. Ends when the client disconnects.
-fn watch_session(stream: &mut UnixStream, request: &Request, runtime: &crate::runtime::Runtime) {
+fn watch_session(
+    stream: &mut UnixStream,
+    request: &Request,
+    run_tx: &std::sync::mpsc::Sender<RunJob>,
+) {
     use std::os::unix::io::AsRawFd;
     // Non-blocking: the post-run drain must return immediately when there is
     // nothing pending; a blocking fd would wait for the next real event and
@@ -1791,9 +1898,15 @@ fn watch_session(stream: &mut UnixStream, request: &Request, runtime: &crate::ru
     let mut watches = std::collections::HashSet::new();
     let cfd = stream.as_raw_fd();
     'sessions: loop {
-        let (out, err, mut response) = capture_stdio(|| handle_run(request, runtime));
-        response.stdout = out;
-        response.stderr = err;
+        // Every refresh runs on the dedicated run-engine thread.
+        let mut response = on_run_engine(run_tx, request.clone(), false).unwrap_or(Response {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: 0.0,
+            error: Some("run engine unavailable".into()),
+            file: None,
+        });
         if write_msg(stream, &response).is_err() {
             break;
         }
