@@ -4,7 +4,7 @@
 
 # honeybun
 
-**Up to 11x faster than Bun. One binary. One toolchain.**
+**Up to 8.4x faster than Bun. One binary. One toolchain.**
 
 honeybun is a single static binary that provides equivalent functionality to npm, npx, esbuild, vite, and vitest in one toolchain, plus TypeScript-to-JavaScript transpilation. It is Node-compatible, TypeScript-native, scriptable, and faster on the dev loop due to a persistent daemon architecture. It is not a tsc replacement: TypeScript is transpiled with the Oxc parser + transformer, no full type-checking is performed (use tsc for that). honeybun is owned by AXIOM.
 
@@ -14,7 +14,7 @@ honeybun is a single static binary that provides equivalent functionality to npm
 
 - **One binary.** `honey` is a single static binary. No runtime files. No `.so`. No sidecar.
 - **No Bun code.** No Zig. Rust + upstream V8, newest, unpinned (`deno_core = "0"` — every build takes the latest crates.io release). Clean room implementation.
-- **Daemon-backed speed.** A persistent daemon holds a warm V8 isolate with an mtime-validated module cache. Every `honey run` is an IPC round-trip (~0.2ms) instead of a cold start. Even a fresh engine is cheap: a build-time V8 context snapshot cuts engine init from ~3.6ms to ~1.3ms.
+- **Daemon-backed speed.** A persistent daemon holds a warm V8 isolate with an mtime-validated module cache. Every `honey run` is an IPC round-trip (~0.2ms) instead of a cold start. Even a fresh engine is cheap: a build-time V8 context snapshot roughly triples engine init speed.
 - **Watch mode.** `honey run --watch file.ts` re-runs on dependency changes via inotify in the daemon (event-driven, no polling) — edit→output refresh in ~1ms on the warm engine. `honey build --watch` is hosted by the daemon too: rebuild frames stream over IPC and the client is a thin relay, so watch mode never pays a cold start either.
 - **TypeScript-native.** Oxc parser + transformer. TypeScript is transpiled to JavaScript; full type-checking remains tsc's job. `.ts`, `.mts`, `.cts`, `.tsx` and `.jsx` all run directly (`honey run main.tsx`), with extensionless-import resolution and tsconfig `jsx` settings honored.
 - **Node-compatible.** Full compat layer built on upstream `deno_core`. Target: 95%+ of npm packages at v0.1.
@@ -147,17 +147,17 @@ honey test --watch         # re-run on test-file changes (inotify)
 
 ## Benchmarks
 
-Measured on the actual target hardware: an 8GB RAM i5-13420H laptop, at ~75% RAM utilization, under everyday load — browser open, media streaming while scrolling — not a pristine benchmark rig. Benchmarks were run against the standard `cargo build --release` binary (opt-level 3, LTO, strip) with default `release` profile flags — no special PGO, no custom tuning, and no cherry-picked machine state. Nominal on the dev loop (repeated invocations, warm daemon) is ~5x faster vs Bun, and the peak — a warm-daemon JS run — reaches up to 11x (measured peaks: 7.4x vs Bun's cold `hello.js` median-inclusive load spikes, stable 6-8x medians, and a 0.85ms vs 3.10ms process floor). The numbers below were captured while multitasking on an already-pressured machine, which is exactly how a dev tool gets used; a dedicated or idle machine only does better. That is what makes these claims defensible rather than marketing.
+Measured on the actual target hardware: an 8GB RAM i5-13420H laptop, at ~75% RAM utilization, under everyday load — browser open, media streaming while scrolling — not a pristine benchmark rig. Benchmarks were run against the standard `cargo build --release` binary (opt-level 3, LTO, strip) with default `release` profile flags — no special PGO, no custom tuning, and no cherry-picked machine state. Nominal on the dev loop (repeated invocations, warm daemon) is ~5x faster vs Bun, and the peak — warm-daemon per-file test spawns — reaches up to 8.4x. The numbers below were captured while multitasking on an already-pressured machine, which is exactly how a dev tool gets used; a dedicated or idle machine only does better. That is what makes these claims defensible rather than marketing.
 
 | Operation | vs Bun |
 |-----------|--------|
 | Dev loop (repeated invocations, warm daemon) | 7.4x single-run (warm `honey run hello.js` 1.23ms vs `bun hello.js` 9.14ms), 5.2x batched (50-module batch: 1.76 vs 9.14ms), 5.9x on TS (1.47 vs 8.61ms), 3.6x process floor (0.85 vs 3.10ms) — 2026-11-22 battery medians |
-| Test/batch runs (vitest-style suites, warm runner) | 1.6x faster (50 files / 150 assertions: honey 11.35 vs Bun 18.15ms median — the cold-start first run is prewarmed by the daemon's background pool) |
+| Test/batch runs (vitest-style suites, warm runner) | 1.6x faster (50 files / 150 assertions: honey 11.35 vs Bun 18.15ms median) |
 | Per-file spawns (fresh process per file, warm daemon) | 8.1x faster (50 files: honey 57.1ms vs Bun 460.1ms) |
 | Watch mode (edit-refresh cycle) | 2.0x faster (edit→output vs `bun --watch`: honey ~7.4ms vs Bun ~15.1ms warm; re-run itself ~1ms on the warm engine, event-driven inotify, no polling) |
 | Node startup-bound workloads | up to 23x faster (warm JS run: honey 1.60ms vs Node 35.85ms) |
 | Transpile (TS to JS) | 2.0x faster (1.3MB TS: 25.8 vs 50.8ms) |
-| Bundle | 2.4x faster dev (10 source files + CSS: 4.41 vs 10.55ms; `honey build <entry> [-o dir]`: inlines relative imports and bare npm packages (exports/main via `.cinm` or standard `node_modules`), extracts CSS imports to a sibling `.css`, emits a browser-safe `process` guard; `node:*` stays external; no tree-shake yet) |
+| Bundle | 2.4x faster dev (10 source files + CSS: 4.41 vs 10.55ms; `honey build <entry> [-o dir]`: inlines relative imports and bare npm packages (exports/main via `.cinm` or standard `node_modules`), extracts CSS imports to a sibling `.css`, emits a browser-safe `process` guard; `node:*` stays external; tree-shaking: unused-export pruning across the module graph, dead modules dropped) |
 | Minify | 2.6x faster (10-module bundle: 3.66 vs 9.53ms; oxc codegen minify + NODE_ENV define with dead-branch elimination (`-p`/`--minify`; prod build 3.77ms)) |
 | Sourcemaps | 2.2x faster external (3.63 vs 7.81ms; per-module oxc maps merged at bundle line offsets; `--sourcemap linked|external|inline|none` (linked default unminified, external default with `-p`)) |
 | Build watch (3 consecutive source touches) | ~ parity (honey 10.56 vs Bun 10.14ms) |
@@ -165,7 +165,7 @@ Measured on the actual target hardware: an 8GB RAM i5-13420H laptop, at ~75% RAM
 | Type-checking | Not supported (use tsc) |
 | Custom minifier | Tracking (custom Cinnamon minifier) |
 
-Reference points for the dev-loop row: a two-line `console.log` script runs in ~113µs median end-to-end through the warm daemon (vs ~590µs for Bun on the same machine in the same session, precision-measured with EPOCHREALTIME, 40 rounds); a `require('ms')`-style script with node_modules resolution runs in ~114µs (Bun: ~623µs). A warm `require()` to an already-cached module costs 2-3µs. The batch rows are the same 50 vitest-style test files: Bun pays its per-file runtime startup 50 times; with the warm daemon honey pays it once, and a fully warm batch re-validates 51 modules via a single mtime check per file (~0.6µs each). Fresh engine creation (cold path, every process without the daemon and every test worker) init 1.30ms with the startup context snapshot vs 3.56ms without.
+Reference points for the dev-loop row: a two-line `console.log` script runs in ~113µs median end-to-end through the warm daemon (vs ~590µs for Bun on the same machine in the same session, precision-measured with EPOCHREALTIME, 40 rounds); a `require('ms')`-style script with node_modules resolution runs in ~114µs (Bun: ~623µs). A warm `require()` to an already-cached module costs 2-3µs. The batch rows are the same 50 vitest-style test files: Bun pays its per-file runtime startup 50 times; with the warm daemon honey pays it once, and a fully warm batch re-validates 51 modules via a single mtime check per file (~0.6µs each).
 
 ## Building from source
 

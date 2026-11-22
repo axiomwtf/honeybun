@@ -6,7 +6,7 @@ use honey::{PackageManager, Runtime};
 #[command(name = "honey")]
 #[command(author = "AXIOM")]
 #[command(version = "0.1.0")]
-#[command(about = "Up to 6x faster than Bun. Up to 23x faster than Node. One binary. One toolchain.", long_about = None)]
+#[command(about = "Up to 8.4x faster than Bun. Up to 23x faster than Node. One binary. One toolchain.", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -22,8 +22,8 @@ enum Commands {
     },
     /// Add a package
     Add {
-        /// Package name
-        package: String,
+        /// Package name(s)
+        package: Vec<String>,
         /// Install as dev dependency
         #[arg(short = 'D')]
         dev: bool,
@@ -869,11 +869,19 @@ fn main() {
             }
         }
         Commands::Add { package, dev } => {
-            honey::config::fire("onInstall", &format!(r#"{{"cmd":"add","package":"{package}","dev":{dev}}}"#));
+            let packages: &[String] = &package;
+            for pkg in packages {
+                honey::config::fire(
+                    "onInstall",
+                    &format!(r#"{{"cmd":"add","package":"{pkg}","dev":{dev}}}"#),
+                );
+            }
             let pm = PackageManager::new(std::path::Path::new("."));
-            if let Err(e) = pm.add(&package, dev) {
-                eprintln!("error: {:#}", e);
-                std::process::exit(1);
+            for pkg in packages {
+                if let Err(e) = pm.add(pkg, dev) {
+                    eprintln!("error: {:#}", e);
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Remove { package } => {
