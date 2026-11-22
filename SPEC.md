@@ -9,7 +9,7 @@ honeybun is a single static binary that provides equivalent functionality to npm
 
 **The output is always exactly one file: `honey` by default.** No JARs. No DLLs. No sidecars. No "requires runtime" asterisks. Every command compiles down to a single binary. If `honey` cannot produce one binary, it fails with an error. It does not produce partial output.
 
-No Bun code. No Zig. Rust + V8 fork.
+No Bun code. No Zig. Rust + upstream V8, newest, unpinned.
 
 ---
 
@@ -29,7 +29,7 @@ No Bun code. No Zig. Rust + V8 fork.
 
 One static binary. No runtime files. No `.so`. No sidecar.
 
-`honey` (CLI, daemon, PM) → `Cinnamon` (engine) → `V8 fork` (runtime)
+`honey` (CLI, daemon, PM) → `Cinnamon` (engine) → `V8` (upstream, newest) (runtime)
 
 ### Components
 
@@ -38,7 +38,7 @@ One static binary. No runtime files. No `.so`. No sidecar.
 | `honey` | CLI, daemon, package manager |
 | `hxney` | One-off package executor (npx/bunx equivalent) |
 | `Cinnamon` | Compiler, Resolver, Bundler, Minifier, `.cinm` layout |
-| `V8 fork` | Runtime (15 small patches + 1 medium) |
+| `V8 (upstream)` | Runtime (newest crates.io `deno_core` + its matched `v8`) |
 
 ---
 
@@ -158,70 +158,38 @@ honey migrate --file x.js  # single file
 
 ---
 
-## 6. V8 Fork
+## 6. V8 (upstream, newest)
 
-### Patch application status
+honey runs on upstream V8 from crates.io — never a fork, never a vendored
+checkout. The dependency is deliberately unpinned (`deno_core = "0"` in
+Cargo.toml), so every build takes the newest `deno_core` release and the V8
+binding it pairs with (exposed as `deno_core::v8`; honey never declares its own
+`v8` crate dependency — the runtime layer owns that pairing). What honey does
+on top of stock V8:
 
-Patches land in three places, by what V8 actually supports:
+1. **Runtime `v8_flags`** (applied in `src/runtime.rs` `apply_v8_flags()` before
+   the first isolate; effective in every shipped binary): Maglev tier threshold
+   400→100 invocations, TurboFan tier threshold 3000→750 invocations, initial
+   heap → 32MB, stack trace limit = 10 and lazy source positions = on (both
+   already V8 defaults, kept explicit).
+2. **Build wiring** (`.cargo/config.toml` + `build.rs`): `target-cpu=native` for
+   all crates, non-PIE final binaries (`-no-pie`, `-z now`, `-z
+   noseparate-code`), LTO + `codegen-units=1` + strip.
+3. **Startup context snapshot** (implemented, see below).
 
-1. **GN args** (`cinnamon/v8/.gn`, exported as `patches/0001-honeybun-v8-gn-args.patch`): WebAssembly off (`v8_enable_webassembly` — renamed from `v8_enable_wasm` in modern V8), Intl/ICU off (`v8_enable_i18n_support`), debug features off (`v8_enable_debugging_features`), huge pages for the code range (`v8_enable_hugepage`), pointer compression (`v8_enable_pointer_compression`; ABI must match rusty_v8's build.rs args.gn). Effective when the fork is built from source; GN ignores unknown names harmlessly.
-2. **Runtime v8_flags** (applied in `src/runtime.rs` `apply_v8_flags()` before the first isolate; effective in every shipped binary today): Maglev tier threshold 400→100 invocations, TurboFan tier threshold 3000→750 invocations, initial heap → 32MB, stack trace limit = 10 and lazy source positions = on (both already V8 defaults, kept explicit).
-3. **Source patches** (future, applied to the V8 submodule when it is cloned): the medium code-cache patch (serialize `node:*` builtin bytecode at build time, embed as `HONEY_SNAPSHOT`), and the true inspector strip (drop the inspector protocol targets from the build graph — no GN toggle exists in V8 15.8).
+Not done: no GN-arg patching (upstream prebuilt archives are used as-is),
+no inspector strip (the inspector is present in the binary; it is dormant),
+no source patches. Fork source builds (`V8_FROM_SOURCE`, RUSTY_V8_ARCHIVE
+against a vendored V8) were tried and removed — the crates.io prebuilt is the
+supported path; "newest upstream" is a hard policy.
 
-Not real, dropped from earlier drafts of the patch list: `v8_enable_webassembly_streaming` (streaming has no toggle; it dies with WebAssembly itself), GC logging (runtime tracing flags, already off), `v8_force_optimize_speed` (covered by `v8_optimized_debug = true`), source-map support (embedder-driven, no build toggle), stack-trace/threshold/heap GN names (they are v8_flags, not build args).
+### Startup Context Snapshot (implemented)
 
-Path-dependency wiring for the fork source build: `patches/0002-honeybun-deno-core-path-deps.patch` (deno_core → the local v8 fork) and `patches/0003-honeybun-deno-path-deps.patch` (deno ext/node → the local deno_core). Apply in order with `git apply patches/*.patch` inside each checkout.
-
-### 15 Small Patches
-
-1. `v8_enable_wasm = false`
-2. `v8_enable_intl = false`
-3. `v8_enable_debug = false`
-4. `v8_enable_webassembly_streaming = false`
-5. `v8_enable_gc_logging = false`
-6. Maglev threshold: 50k to 10k
-7. TurboFan threshold: 1M to 200k
-8. `v8_force_optimize_speed = true`
-9. `v8_enable_hugepage = true`
-10. Initial heap: 256MB to 32MB
-11. `v8_enable_lazy_source_position = true`
-12. Stack trace depth: 50 to 10
-13. `v8_enable_source_map_support = false`
-14. `v8_enable_pointer_compression = true`
-15. Strip `v8/src/inspector/`
-
-### 1 Medium Patch: Startup Context Snapshot (implemented)
-
-- **Build-time:** `honey --internal-mksnapshot` builds a pristine engine (no honey extension), runs a short warmup script (JSON, Date, closures, promises) to bake IC state into the context, and serializes it to `target/honey_snapshot.bin`
-- **Embed:** `build.rs` detects the blob, emits `include_bytes!` glue, the next `cargo build` ships it in-binary (~0.5MB); tracked via `rerun-if-changed` so adding/removing the blob triggers a rebuild
-- **Runtime:** `build_runtime()` passes `RuntimeOptions::startup_snapshot`; deno_core restores isolate + context from the blob (`Context::from_snapshot`) and re-runs the honey extension's global middleware (require/console/process/Buffer/timers) on the restored global — middleware runs in both init paths upstream
+- **Build-time:** `honey --internal-mksnapshot` builds a pristine engine (no honey extension), runs a short warmup script (JSON, Date, closures, promises) to bake IC state into the context, and serializes it to `target/honey_snapshot.bin`. Regenerate the blob (and rebuild) whenever the runtime's context setup changes.
+- **Embed:** `build.rs` detects the blob, emits `include_bytes!` glue, the next `cargo build` ships it in-binary (~0.6MB); tracked via `rerun-if-changed` so adding/removing the blob triggers a rebuild
+- **Runtime:** `build_runtime()` passes `RuntimeOptions::startup_snapshot`; deno_core restores isolate + context from the blob and re-runs the honey extension's global middleware (require/console/process/Buffer/timers) on the restored global — middleware runs in both init paths upstream
 - **Measured:** steady-state engine init 3.56ms -> 1.30ms (~2.7x), A/B inside one binary via `honey --internal-enginetiming` with HONEY_MKSNAPSHOT toggling the path
-- **Constraint / divergence from the original design:** the original spec called for serializing `node:*` builtin bytecode via `ScriptCompiler::Compile`. Honey's node-compat globals are plain `v8::Function` objects holding raw Rust callback addresses, which V8's snapshot serializer refuses to encode (upstream bakes callbacks in via `FunctionTemplate`/op registry, honey does not) — the serializer aborts with "Unknown external reference". The implemented blob therefore captures the pristine context (isolate creation, builtins, deno_core internals) and the extension middleware re-injects globals at engine creation, which is where the remaining ~1.3ms goes. A full globals-in-snapshot design needs the builtin surface moved to `FunctionTemplate`s + ops.
-- **Rebase cost:** done only when needed (a patch breaks on bump, a new V8 feature is wanted, or a security CVE lands); in practice roughly every 3-6 months
-
-### Patching Strategy
-
-The fork is upstream V8 with a small set of patches applied at build time.
-
-**Patch application** — A `patches/` directory holds diff files applied in order via `git apply` or `patch -p1`. Each patch is a one-line change (build flag) or a small targeted modification.
-
-**Build configuration** — The patches modify `v8.gni` and `BUILD.gn` files:
-```
-v8_enable_wasm = false
-v8_enable_intl = false
-v8_enable_debug = false
-v8_force_optimize_speed = true
-v8_enable_hugepage = true
-```
-
-**Rebase process** — Rebases are event-driven, not scheduled: a patch breaks on a bump, a new V8 feature is wanted, or a security CVE lands (roughly every 3-6 months):
-1. Update the V8 checkout
-2. Run `git apply patches/*.patch` in order
-3. If any patch fails, resolve conflicts (usually trivial - the flags haven't changed in years)
-4. Rebuild, run the test suite
-5. Commit the new version
-
-**The medium patch (startup context snapshot)** — Implemented as described above; the code sketch below shows the original code-cache intent for reference. It touches source/build wiring, not just build flags. At build time a script serializes the V8 context; the blob is embedded in the binary as a static array.
+- **Constraint:** the blob captures the pristine context (isolate creation, builtins, deno_core internals); the extension middleware re-injects globals at engine creation, which is where the remaining ~1.3ms goes. A full globals-in-snapshot design needs the builtin surface moved to `FunctionTemplate`s + ops (honey's node-compat globals are plain `v8::Function` objects holding raw Rust callback addresses, which V8's snapshot serializer refuses to encode).
 
 ```rust
 // Build step
@@ -237,10 +205,10 @@ let runtime = JsRuntime::new(RuntimeOptions {
 
 ### Node Compatibility
 
-- Full compat layer (`deno_node` equivalent, forked from deno)
+- Full compat layer (`deno_node` equivalent, built on upstream deno_core)
 - Target: 95%+ of npm packages at v0.1
 - Native addons (`.node`): v0.2
-- No Bun code. Forked deno (deno_core + deno_node, fully optimized). Clean room.
+- No Bun code. Upstream deno_core + V8, newest, unpinned. Clean room.
 
 ---
 
@@ -394,7 +362,7 @@ Optional, for the fastest possible engine init (§6): after the first build, run
 
 ## 14. Notes
 
-- No Bun code. No Zig. Forked deno (deno_core + deno_node, fully optimized). Clean room.
+- No Bun code. No Zig. Upstream deno_core + V8, newest, unpinned. Clean room.
 - The compiler is written in Rust (edition 2024) and lives in `src/`
 - The daemon is the single biggest architectural decision in the whole project
 - Every `honey run` in the dev loop is an IPC round-trip (~0.2ms on top of a ~90µs process floor) instead of a cold runtime start. That's the up-to-6x claim on single-run and watch workloads.

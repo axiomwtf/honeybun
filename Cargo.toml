@@ -3,7 +3,7 @@ name = "honey"
 version = "0.1.0"
 edition = "2024"
 authors = ["AXIOM"]
-description = "Up to 14x faster than Bun. Up to 100x faster than Node. One binary. One toolchain."
+# dont add a description
 
 [[bin]]
 name = "honey"
@@ -23,8 +23,12 @@ flate2 = "1.0"
 tar = "0.4"
 anyhow = "1.0"
 futures = "0.3"
-v8 = "0.101"
-deno_core = "0.300"
+# Newest upstream, always: no version pin. Whatever crates.io has latest.
+# (v8 itself comes in through deno_core::v8, version-matched by deno_core.)
+deno_core = "0"
+# Crate dependency of deno_core's ModuleLoader (JsErrorBox lives here,
+# deno_core does not re-export it).
+deno_error = "0.7"
 oxc_parser = "0.40"
 oxc_transformer = "0.40"
 oxc_ast = "0.40"

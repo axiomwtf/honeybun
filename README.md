@@ -12,12 +12,12 @@ honeybun is a single static binary that provides equivalent functionality to npm
 
 ## Why
 
-- **One binary.** `honey` is a single static binary (~40MB). No runtime files. No `.so`. No sidecar.
-- **No Bun code.** No Zig. Rust + a forked V8 + a forked deno (deno_core + deno_node, fully optimized). Clean room implementation.
+- **One binary.** `honey` is a single static binary. No runtime files. No `.so`. No sidecar.
+- **No Bun code.** No Zig. Rust + upstream V8, newest, unpinned (`deno_core = "0"` — every build takes the latest crates.io release). Clean room implementation.
 - **Daemon-backed speed.** A persistent daemon holds a warm V8 isolate with an mtime-validated module cache. Every `honey run` is an IPC round-trip (~0.2ms) instead of a cold start. Even a fresh engine is cheap: a build-time V8 context snapshot cuts engine init from ~3.6ms to ~1.3ms.
 - **Watch mode.** `honey run --watch file.ts` re-runs on dependency changes via inotify in the daemon (event-driven, no polling) — edit→output refresh in ~1ms on the warm engine. `honey build --watch` is hosted by the daemon too: rebuild frames stream over IPC and the client is a thin relay, so watch mode never pays a cold start either.
 - **TypeScript-native.** Oxc parser + transformer. TypeScript is transpiled to JavaScript; full type-checking remains tsc's job. `.ts`, `.mts`, `.cts`, `.tsx` and `.jsx` all run directly (`honey run main.tsx`), with extensionless-import resolution and tsconfig `jsx` settings honored.
-- **Node-compatible.** Full compat layer (deno_node equivalent, forked from deno). Target: 95%+ of npm packages at v0.1.
+- **Node-compatible.** Full compat layer built on upstream `deno_core`. Target: 95%+ of npm packages at v0.1.
 
 ## Naming
 
@@ -34,7 +34,7 @@ honeybun is a single static binary that provides equivalent functionality to npm
 One static binary. No runtime files. No `.so`. No sidecar.
 
 ```
-honey (CLI, daemon, PM) → Cinnamon (engine) → V8 fork (runtime)
+honey (CLI, daemon, PM) → Cinnamon (engine) → V8 (upstream, newest) (runtime)
 ```
 
 | Component | Role |
@@ -42,7 +42,7 @@ honey (CLI, daemon, PM) → Cinnamon (engine) → V8 fork (runtime)
 | `honey` | CLI, daemon, package manager |
 | `hxney` | One-off package executor (npx/bunx equivalent) |
 | `Cinnamon` | Compiler, Resolver, Bundler, Minifier, `.cinm` layout |
-| `V8 fork` | Runtime (15 small patches + 1 medium) |
+| `V8 (upstream)` | Runtime (newest crates.io `deno_core` + its matched `v8`) |
 
 ## Daemon
 
@@ -145,37 +145,6 @@ honey test --watch         # re-run on test-file changes (inotify)
 - Built-in assertions: an `expect`/`describe`/`it` shim is injected as a preload
 - Limitation: parallel runs pay fresh engine init per worker (the warm claim applies to hot re-runs, not first parallel pass)
 
-## V8 Fork
-
-honeybun uses a forked V8. The patch set lands in three layers: GN build args in the fork checkout (`cinnamon/v8/.gn`, also exported as `patches/0001-honeybun-v8-gn-args.patch`), runtime `v8_flags` applied at engine creation in [src/runtime.rs](./src/runtime.rs) (tiering thresholds, initial heap — effective in every binary today), and the startup-context snapshot (implemented; built by `honey --internal-mksnapshot`, embedded by `build.rs`). The inspector strip remains a source-patch follow-up. See SPEC.md §6 for the per-patch mapping and upstream verification notes.
-
-### 15 Small Patches
-
-1. `v8_enable_wasm = false`
-2. `v8_enable_intl = false`
-3. `v8_enable_debug = false`
-4. `v8_enable_webassembly_streaming = false`
-5. `v8_enable_gc_logging = false`
-6. Maglev threshold: 50k to 10k
-7. TurboFan threshold: 1M to 200k
-8. `v8_force_optimize_speed = true`
-9. `v8_enable_hugepage = true`
-10. Initial heap: 256MB to 32MB
-11. `v8_enable_lazy_source_position = true`
-12. Stack trace depth: 50 to 10
-13. `v8_enable_source_map_support = false`
-14. `v8_enable_pointer_compression = true`
-15. Strip `v8/src/inspector/`
-
-### Medium Patch: Startup Context Snapshot (implemented)
-
-- Build-time: `honey --internal-mksnapshot` builds a pristine engine, runs a warmup script, serializes the V8 context to `target/honey_snapshot.bin`
-- Embed: `build.rs` detects the blob and `include_bytes!`s it; the next `cargo build` ships it in the binary (~0.5MB)
-- Runtime: every engine creation restores isolate + context from the snapshot instead of building from scratch; the honey extension's global middleware (require/console/process/Buffer/timers) re-runs on the restored context
-- Measured: engine init 3.56ms -> 1.30ms steady-state (~2.7x), A/B inside one binary
-- Constraint: the globals are plain `v8::Function` objects with raw Rust callback addresses, which V8's snapshot serializer cannot encode (upstream bakes callbacks in via `FunctionTemplate`/op registry) — so the blob captures the pristine context, not the globals
-- Rebase cost: done only when needed (a patch breaks on bump, a new V8 feature is wanted, or a security CVE lands); in practice roughly every 3-6 months
-
 ## Benchmarks
 
 Measured on the actual target hardware: an 8GB RAM i5-13420H laptop, at ~75% RAM utilization, under everyday load — browser open, media streaming while scrolling — not a pristine benchmark rig. Benchmarks were run against the standard `cargo build --release` binary (opt-level 3, LTO, strip) with default `release` profile flags — no special PGO, no custom tuning, and no cherry-picked machine state. The numbers below were captured while multitasking on an already-pressured machine, which is exactly how a dev tool gets used; a dedicated or idle machine only does better. That is what makes these claims defensible rather than marketing.
@@ -213,7 +182,8 @@ Dependencies (compile-time; everything statically linked except base system libs
 
 ```
 clap, tokio, reqwest (rustls-tls), serde, serde_json, flate2, tar, anyhow,
-futures, libc, deno_core, v8, oxc_parser, oxc_transformer, oxc_semantic,
+futures, libc, deno_core (newest, unpinned; brings its own matched v8),
+deno_error, oxc_parser, oxc_transformer, oxc_semantic,
 oxc_codegen, oxc_allocator, oxc_span
 ```
 

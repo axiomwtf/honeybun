@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use deno_core::{JsRuntime, RuntimeOptions, ModuleSpecifier, ModuleSourceCode, ModuleCodeString, ModuleType, ModuleLoader, ModuleLoadResponse, ModuleSource, ResolutionKind, RequestedModuleType, Extension, v8};
+use deno_core::{JsRuntime, RuntimeOptions, ModuleSpecifier, ModuleSourceCode, ModuleCodeString, ModuleType, ModuleLoader, ModuleLoadResponse, ModuleLoadReferrer, ModuleLoadOptions, ModuleSource, ResolutionKind, Extension, v8};
 use deno_core::error::AnyError;
 use serde_json;
 use std::path::{Path, PathBuf};
@@ -263,18 +263,18 @@ impl Runtime {
             return (runtime, Ok(1));
         }
         let exit_code = {
-            let mut scope = runtime.handle_scope();
+            deno_core::scope!(scope, runtime);
             let context = scope.get_current_context();
-            let global = context.global(&mut scope);
-            let pk = v8::String::new(&mut scope, "process").unwrap();
+            let global = context.global(scope);
+            let pk = v8::String::new(scope, "process").unwrap();
             global
-                .get(&mut scope, pk.into())
-                .and_then(|v| v.to_object(&mut scope))
+                .get(scope, pk.into())
+                .and_then(|v| v.to_object(scope))
                 .and_then(|p| {
-                    let ek = v8::String::new(&mut scope, "exitCode").unwrap();
-                    p.get(&mut scope, ek.into())
+                    let ek = v8::String::new(scope, "exitCode").unwrap();
+                    p.get(scope, ek.into())
                 })
-                .and_then(|v| v.int32_value(&mut scope))
+                .and_then(|v| v.int32_value(scope))
                 .unwrap_or(0)
         };
         (runtime, Ok(exit_code))
@@ -295,7 +295,7 @@ impl Runtime {
                 .execute_script("honey:eval", code.to_owned())
                 .map_err(|e| format!("{e:#}"))?;
             let serialized = {
-                let scope = &mut runtime.handle_scope();
+                deno_core::scope!(scope, runtime);
                 let local = v8::Local::new(scope, &global);
                 if local.is_undefined() || local.is_null() {
                     None
@@ -401,19 +401,19 @@ impl Runtime {
             // correctly anchored per-module require.
             let t_cjs = std::time::Instant::now();
             let cjs_outcome: Result<Option<i32>> = (|| {
-                let mut scope = runtime.handle_scope();
+                deno_core::scope!(scope, runtime);
                 let context = scope.get_current_context();
-                let global = context.global(&mut scope);
-                let require_key = v8::String::new(&mut scope, "require").unwrap();
+                let global = context.global(scope);
+                let require_key = v8::String::new(scope, "require").unwrap();
                 let require_val = global
-                    .get(&mut scope, require_key.into())
+                    .get(scope, require_key.into())
                     .ok_or_else(|| anyhow::anyhow!("global require missing"))?;
                 let require_fn = v8::Local::<v8::Function>::try_from(require_val)
                     .map_err(|_| anyhow::anyhow!("global require is not a function"))?;
-                let arg = v8::String::new(&mut scope, &full_path.to_string_lossy()).unwrap();
-                let undefined = v8::undefined(&mut scope);
-                let mut tc = v8::TryCatch::new(&mut scope);
-                let result = require_fn.call(&mut tc, undefined.into(), &[arg.into()]);
+                let arg = v8::String::new(scope, &full_path.to_string_lossy()).unwrap();
+                let undefined = v8::undefined(scope);
+                v8::tc_scope!(let tc, scope);
+                let result = require_fn.call(tc, undefined.into(), &[arg.into()]);
                 let forced_exit = take_exit_request();
                 if let Some(code) = forced_exit {
                     use std::io::Write as _;
@@ -425,13 +425,13 @@ impl Runtime {
                     let msg_parts = tc
                         .exception()
                         .and_then(|exc| {
-                            let exc_local = v8::Local::new(&mut tc, exc);
+                            let exc_local = v8::Local::new(tc, exc);
                             if let Ok(o) = v8::Local::<v8::Object>::try_from(exc_local) {
-                                let stack_key = v8::String::new(&mut tc, "stack").unwrap();
-                                o.get(&mut tc, stack_key.into())
-                                    .and_then(|v| get_str(&mut tc, v))
+                                let stack_key = v8::String::new(tc, "stack").unwrap();
+                                o.get(tc, stack_key.into())
+                                    .and_then(|v| get_str(tc, v))
                             } else {
-                                get_str(&mut tc, exc_local)
+                                get_str(tc, exc_local)
                             }
                         })
                         .unwrap_or_else(|| "unknown error".to_string());
@@ -471,18 +471,18 @@ impl Runtime {
             return (runtime, Ok(1));
         }
         let exit_code = {
-            let mut scope = runtime.handle_scope();
+            deno_core::scope!(scope, runtime);
             let context = scope.get_current_context();
-            let global = context.global(&mut scope);
-            let pk = v8::String::new(&mut scope, "process").unwrap();
+            let global = context.global(scope);
+            let pk = v8::String::new(scope, "process").unwrap();
             global
-                .get(&mut scope, pk.into())
-                .and_then(|v| v.to_object(&mut scope))
+                .get(scope, pk.into())
+                .and_then(|v| v.to_object(scope))
                 .and_then(|p| {
-                    let ek = v8::String::new(&mut scope, "exitCode").unwrap();
-                    p.get(&mut scope, ek.into())
+                    let ek = v8::String::new(scope, "exitCode").unwrap();
+                    p.get(scope, ek.into())
                 })
-                .and_then(|v| v.int32_value(&mut scope))
+                .and_then(|v| v.int32_value(scope))
                 .unwrap_or(0)
         };
         (runtime, Ok(exit_code))
@@ -680,25 +680,25 @@ fn warm_prepare(runtime: &mut JsRuntime, main_path: &Path) {
     MODULE_CACHE.with(|c| c.borrow_mut().remove(&main_key));
 
     // 2. Reset per-run globals inside the retained isolate.
-    let mut scope = runtime.handle_scope();
+    deno_core::scope!(scope, runtime);
     let context = scope.get_current_context();
-    let global = context.global(&mut scope);
-    let pk = v8::String::new(&mut scope, "process").unwrap();
-    if let Some(p) = global.get(&mut scope, pk.into()).and_then(|v| v.to_object(&mut scope)) {
+    let global = context.global(scope);
+    let pk = v8::String::new(scope, "process").unwrap();
+    if let Some(p) = global.get(scope, pk.into()).and_then(|v| v.to_object(scope)) {
         // argv
         let args = ARGS.with(|a| a.borrow().clone());
-        let argv = v8::Array::new(&mut scope, args.len() as i32);
+        let argv = v8::Array::new(scope, args.len() as i32);
         for (i, a) in args.iter().enumerate() {
-            let s = v8::String::new(&mut scope, a).unwrap();
-            let idx = v8::Number::new(&mut scope, i as f64);
-            argv.set(&mut scope, idx.into(), s.into());
+            let s = v8::String::new(scope, a).unwrap();
+            let idx = v8::Number::new(scope, i as f64);
+            argv.set(scope, idx.into(), s.into());
         }
-        let argv_key = v8::String::new(&mut scope, "argv").unwrap();
-        p.set(&mut scope, argv_key.into(), argv.into());
+        let argv_key = v8::String::new(scope, "argv").unwrap();
+        p.set(scope, argv_key.into(), argv.into());
         // exitCode back to 0
-        let eck = v8::String::new(&mut scope, "exitCode").unwrap();
-        let zero = v8::Number::new(&mut scope, 0.0);
-        p.set(&mut scope, eck.into(), zero.into());
+        let eck = v8::String::new(scope, "exitCode").unwrap();
+        let zero = v8::Number::new(scope, 0.0);
+        p.set(scope, eck.into(), zero.into());
     }
 }
 
@@ -706,8 +706,8 @@ use std::borrow::Cow;
 
 struct HoneyModuleLoader;
 
-impl ModuleLoader for HoneyModuleLoader {
-    fn resolve(
+impl HoneyModuleLoader {
+    fn resolve_anyhow(
         &self,
         specifier: &str,
         referrer: &str,
@@ -799,13 +799,24 @@ impl ModuleLoader for HoneyModuleLoader {
 
         Ok(resolved)
     }
+}
+
+impl ModuleLoader for HoneyModuleLoader {
+    fn resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        kind: ResolutionKind,
+    ) -> Result<ModuleSpecifier, deno_error::JsErrorBox> {
+        self.resolve_anyhow(specifier, referrer, kind)
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("{e:#}")))
+    }
 
     fn load(
         &self,
         module_specifier: &ModuleSpecifier,
-        _maybe_referrer: Option<&ModuleSpecifier>,
-        _is_dyn_import: bool,
-        _requested_module_type: RequestedModuleType,
+        _maybe_referrer: Option<&ModuleLoadReferrer>,
+        _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let spec_str = module_specifier.as_str();
 
@@ -843,7 +854,7 @@ impl ModuleLoader for HoneyModuleLoader {
         let path = match stripped.to_file_path() {
             Ok(p) => p,
             Err(_) => {
-                return ModuleLoadResponse::Sync(Err(AnyError::msg(format!(
+                return ModuleLoadResponse::Sync(Err(deno_error::JsErrorBox::generic(format!(
                     "failed to convert module specifier to path: {}",
                     spec_str
                 ))));
@@ -852,7 +863,7 @@ impl ModuleLoader for HoneyModuleLoader {
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                return ModuleLoadResponse::Sync(Err(AnyError::msg(format!(
+                return ModuleLoadResponse::Sync(Err(deno_error::JsErrorBox::generic(format!(
                     "failed to read module {}: {}",
                     path.display(),
                     e
@@ -864,7 +875,11 @@ impl ModuleLoader for HoneyModuleLoader {
         // before ESM/CJS wrapping.
         let source = match transpile_if_typescript(&path.to_string_lossy(), &source) {
             Ok(s) => s,
-            Err(e) => return ModuleLoadResponse::Sync(Err(AnyError::msg(e))),
+            Err(e) => {
+                return ModuleLoadResponse::Sync(Err(deno_error::JsErrorBox::generic(format!(
+                    "{e:#}"
+                ))))
+            }
         };
 
         let wrapped_source = wrap_commonjs_if_needed(&strip_shebang(&source), &path);
@@ -911,7 +926,7 @@ fn wrap_commonjs_if_needed(source: &str, path: &Path) -> String {
 }
 
 fn global_object_middleware(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     global: v8::Local<v8::Object>,
 ) {
     // Inject require function (with .resolve)
@@ -1100,7 +1115,7 @@ const STRUCTURED_CLONE_JS: &str = r#"
 "#;
 
 fn setup_process_object<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     process: &v8::Local<'s, v8::Object>,
 ) {
     // argv: [honey, script, ...user args]
@@ -1183,7 +1198,7 @@ fn setup_process_object<'s>(
     process.set(scope, arch_key.into(), arch.into());
 }
 
-fn get_str(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> Option<String> {
+fn get_str(scope: &mut v8::PinScope, v: v8::Local<v8::Value>) -> Option<String> {
     if v.is_undefined() || v.is_null() {
         return None;
     }
@@ -1207,7 +1222,7 @@ impl<'s> AsObjectLocal<'s> for &v8::Local<'s, v8::Object> {
 }
 
 fn set_fn<'s, O>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     obj: O,
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
@@ -1218,7 +1233,7 @@ fn set_fn<'s, O>(
 }
 
 fn set_function(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     obj: &v8::Local<v8::Object>,
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
@@ -1229,7 +1244,7 @@ fn set_function(
 }
 
 fn honey_set_require_dir_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut _rv: v8::ReturnValue,
 ) {
@@ -1239,7 +1254,7 @@ fn honey_set_require_dir_callback(
 }
 
 fn require_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1718,7 +1733,7 @@ pub(crate) fn transpile_if_typescript(path_str: &str, source: &str) -> std::resu
 }
 
 fn require_resolve_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1799,7 +1814,7 @@ fn builtin_export_list(name: &str) -> &'static [&'static str] {
 }
 
 fn require_module_internal(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     module_name: &str,
     rv: &mut v8::ReturnValue,
 ) {
@@ -2049,11 +2064,11 @@ return (function(exports, require, module, __filename, __dirname) {{
         // A compile (parse) failure must reach the enclosing TryCatch: without
         // an inner TryCatch here the exception is never observed by the
         // require machinery and the module silently "succeeds".
-        let mut tc_compile = v8::TryCatch::new(scope);
-        match v8::Script::compile(&mut tc_compile, code, Some(&origin)) {
+        v8::tc_scope!(let tc_compile, scope);
+        match v8::Script::compile(tc_compile, code, Some(&origin)) {
             Some(s) => s,
             None => {
-                global.set(&mut tc_compile, module_key.into(), prev_module_val.unwrap_or(undefined.into()));
+                global.set(tc_compile, module_key.into(), prev_module_val.unwrap_or(undefined.into()));
                 MODULE_DIR.with(|d| d.replace(previous_dir));
                 tc_compile.rethrow();
                 return;
@@ -2062,8 +2077,8 @@ return (function(exports, require, module, __filename, __dirname) {{
     };
     
     let run_failure: Option<v8::Global<v8::Value>> = {
-        let mut tc = v8::TryCatch::new(scope);
-        let r = script.run(&mut tc);
+        v8::tc_scope!(let tc, scope);
+        let r = script.run(tc);
         if phase_trace_enabled() {
             phase_trace("cjs_compile+run", t_cjs_compile.elapsed());
         }
@@ -2073,15 +2088,15 @@ return (function(exports, require, module, __filename, __dirname) {{
             let mut exc_global: Option<v8::Global<v8::Value>> = None;
             if let Some(exc) = tc.exception() {
                 if let Ok(obj) = v8::Local::<v8::Object>::try_from(exc) {
-                    let stack_key = v8::String::new(&mut tc, "stack").unwrap();
-                    if let Some(stack) = obj.get(&mut tc, stack_key.into()) {
-                        if let Some(s) = get_str(&mut tc, stack) {
+                    let stack_key = v8::String::new(tc, "stack").unwrap();
+                    if let Some(stack) = obj.get(tc, stack_key.into()) {
+                        if let Some(s) = get_str(tc, stack) {
                             parts.push(s);
                         }
                     }
                 }
                 if parts.is_empty() {
-                    if let Some(s) = get_str(&mut tc, exc) {
+                    if let Some(s) = get_str(tc, exc) {
                         parts.push(s);
                     }
                 }
@@ -2089,7 +2104,7 @@ return (function(exports, require, module, __filename, __dirname) {{
                 if parts.iter().all(|p| !p.contains("__honey_exit__")) {
                     eprintln!("honey: module failed: {} -> {}", resolved, parts.join("\n"));
                 }
-                exc_global = Some(v8::Global::new(&mut tc, exc));
+                exc_global = Some(v8::Global::new(tc, exc));
             }
             exc_global
         } else {
@@ -2432,7 +2447,7 @@ fn resolve_with_extensions(path: &Path) -> Result<String> {
 }
 
 fn get_builtin_module<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     name: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
     let module = v8::Object::new(scope);
@@ -2620,7 +2635,7 @@ fn get_builtin_module<'s>(
 }
 
 fn make_fs_promises_module<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
 ) -> v8::Local<'s, v8::Object> {
     let promises = v8::Object::new(scope);
     set_function(scope, &promises, "readFile", fs_promise_read_callback);
@@ -2640,7 +2655,7 @@ fn make_fs_promises_module<'s>(
 }
 
 fn fs_promise_unsupported_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -2687,7 +2702,7 @@ const EVENTS_EMITTER_JS: &str = r#"
 })()
 "#;
 
-fn eval_js_source<'s>(scope: &mut v8::HandleScope<'s>, src: &str) -> Option<v8::Local<'s, v8::Value>> {
+fn eval_js_source<'s>(scope: &mut v8::PinScope<'s, '_>, src: &str) -> Option<v8::Local<'s, v8::Value>> {
     let code = v8::String::new(scope, src)?;
     let script = v8::Script::compile(scope, code, None)?;
     script.run(scope)
@@ -2851,7 +2866,7 @@ fn join_paths(base: &str, next: &str) -> String {
 }
 
 fn path_join_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -2871,7 +2886,7 @@ fn path_join_callback(
 }
 
 fn path_resolve_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -2902,7 +2917,7 @@ fn path_resolve_callback(
 }
 
 fn path_dirname_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -2913,7 +2928,7 @@ fn path_dirname_callback(
 }
 
 fn path_basename_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -2924,7 +2939,7 @@ fn path_basename_callback(
 }
 
 fn path_extname_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -2939,7 +2954,7 @@ fn path_extname_callback(
 }
 
 fn path_relative_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -2964,7 +2979,7 @@ fn path_relative_callback(
 }
 
 fn path_is_absolute_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -2973,7 +2988,7 @@ fn path_is_absolute_callback(
 }
 
 fn path_normalize_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -2983,7 +2998,7 @@ fn path_normalize_callback(
 }
 
 fn path_parse_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3019,7 +3034,7 @@ fn path_parse_callback(
 }
 
 fn path_format_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3031,7 +3046,7 @@ fn path_format_callback(
             return;
         }
     };
-    let get_prop = |scope: &mut v8::HandleScope, name: &str| -> String {
+    let get_prop = |scope: &mut v8::PinScope, name: &str| -> String {
         let k = v8::String::new(scope, name).unwrap();
         obj.get(scope, k.into())
             .and_then(|v| get_str(scope, v))
@@ -3063,7 +3078,7 @@ fn path_format_callback(
 // ---------- fs helpers ----------
 
 fn fs_read_file_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3142,7 +3157,7 @@ fn fs_read_file_sync_callback(
 fn err_val_to_val(_v: &mut v8::Local<v8::Value>) {}
 
 fn typed_array_to_string_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3161,7 +3176,7 @@ fn typed_array_to_string_callback(
 }
 
 fn typed_array_slice_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3180,7 +3195,7 @@ fn typed_array_slice_callback(
     rv.set(arr.into());
 }
 
-fn typed_array_bytes(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> Option<Vec<u8>> {
+fn typed_array_bytes(scope: &mut v8::PinScope, v: v8::Local<v8::Value>) -> Option<Vec<u8>> {
     if let Ok(ta) = v8::Local::<v8::Uint8Array>::try_from(v) {
         let len = ta.byte_length();
         let mut buf = vec![0u8; len];
@@ -3215,7 +3230,7 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 fn fs_write_file_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3238,7 +3253,7 @@ fn fs_write_file_sync_callback(
 }
 
 fn fs_exists_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3247,7 +3262,7 @@ fn fs_exists_sync_callback(
 }
 
 fn fs_stat_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3284,7 +3299,7 @@ fn fs_stat_sync_callback(
 }
 
 fn make_stat_object<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     is_file: bool,
     is_dir: bool,
     is_symlink: bool,
@@ -3302,7 +3317,7 @@ fn make_stat_object<'s>(
 }
 
 fn fs_readdir_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3331,7 +3346,7 @@ fn fs_readdir_sync_callback(
 }
 
 fn fs_mkdir_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -3345,7 +3360,7 @@ fn fs_mkdir_sync_callback(
 }
 
 fn fs_realpath_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3365,7 +3380,7 @@ fn fs_realpath_sync_callback(
 }
 
 fn fs_copy_file_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -3380,7 +3395,7 @@ fn fs_copy_file_sync_callback(
 }
 
 fn fs_unlink_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -3396,7 +3411,7 @@ fn fs_unlink_sync_callback(
 // ---------- fs promises (sync work wrapped in resolved promises) ----------
 
 fn resolve_promise_with_value<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     value: Option<v8::Local<v8::Value>>,
     error_msg: Option<String>,
 ) -> v8::Local<'s, v8::Value> {
@@ -3420,7 +3435,7 @@ fn resolve_promise_with_value<'s>(
 }
 
 fn fs_promise_read_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3463,7 +3478,7 @@ fn fs_promise_read_callback(
 }
 
 fn fs_promise_write_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3492,7 +3507,7 @@ fn fs_promise_write_callback(
 }
 
 fn fs_promise_stat_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3532,7 +3547,7 @@ fn fs_promise_stat_callback(
 }
 
 fn fs_promise_readdir_callback<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3584,7 +3599,7 @@ fn fs_promise_readdir_callback<'s>(
 }
 
 fn make_dirent_object<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     name: &str,
     is_dir: bool,
     is_file: bool,
@@ -3599,7 +3614,7 @@ fn make_dirent_object<'s>(
 }
 
 fn fs_promise_mkdir_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3620,7 +3635,7 @@ fn fs_promise_mkdir_callback(
 }
 
 fn fs_promise_access_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3638,7 +3653,7 @@ fn fs_promise_access_callback(
 }
 
 fn fs_promise_unlink_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3651,7 +3666,7 @@ fn fs_promise_unlink_callback(
 // ---------- os ----------
 
 fn os_platform_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3660,7 +3675,7 @@ fn os_platform_callback(
 }
 
 fn os_arch_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3669,7 +3684,7 @@ fn os_arch_callback(
 }
 
 fn os_homedir_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3679,7 +3694,7 @@ fn os_homedir_callback(
 }
 
 fn os_tmpdir_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3689,7 +3704,7 @@ fn os_tmpdir_callback(
 }
 
 fn os_hostname_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3698,7 +3713,7 @@ fn os_hostname_callback(
 }
 
 fn os_release_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3709,7 +3724,7 @@ fn os_release_callback(
 // ---------- util ----------
 
 fn util_inspect_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3725,7 +3740,7 @@ fn util_inspect_callback(
 }
 
 fn util_format_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3784,7 +3799,7 @@ fn util_format_callback(
     rv.set(out_str.into());
 }
 
-fn number_to_string(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> String {
+fn number_to_string(scope: &mut v8::PinScope, v: v8::Local<v8::Value>) -> String {
     if let Some(n) = v.number_value(scope) {
         format!("{}", n)
     } else {
@@ -3792,7 +3807,7 @@ fn number_to_string(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> Str
     }
 }
 
-fn value_to_display_string(scope: &mut v8::HandleScope, val: v8::Local<v8::Value>) -> String {
+fn value_to_display_string(scope: &mut v8::PinScope, val: v8::Local<v8::Value>) -> String {
     if val.is_string() {
         val.to_string(scope).unwrap().to_rust_string_lossy(scope)
     } else if let Some(json) = v8::json::stringify(scope, val) {
@@ -3803,7 +3818,7 @@ fn value_to_display_string(scope: &mut v8::HandleScope, val: v8::Local<v8::Value
 }
 
 fn util_inherits_callback(
-    _scope: &mut v8::HandleScope,
+    _scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -3812,7 +3827,7 @@ fn util_inherits_callback(
 }
 
 fn util_promisify_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3858,7 +3873,7 @@ fn util_promisify_callback(
 }
 
 fn util_deprecate_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3867,7 +3882,7 @@ fn util_deprecate_callback(
 }
 
 fn util_debuglog_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3876,7 +3891,7 @@ fn util_debuglog_callback(
 }
 
 fn util_is_thenable_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3885,7 +3900,7 @@ fn util_is_thenable_callback(
 }
 
 fn util_style_text_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3918,7 +3933,7 @@ fn util_style_text_callback(
 }
 
 fn util_strip_vt_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3953,7 +3968,7 @@ fn util_strip_vt_callback(
 // ---------- url ----------
 
 fn url_path_to_file_url_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3991,7 +4006,7 @@ fn url_path_to_file_url_callback(
 }
 
 fn url_to_string_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4009,7 +4024,7 @@ fn url_to_string_callback(
 }
 
 fn url_file_to_path_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4030,7 +4045,7 @@ fn url_file_to_path_callback(
 // ---------- module ----------
 
 fn module_enable_compile_cache_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4041,7 +4056,7 @@ fn module_enable_compile_cache_callback(
 }
 
 fn module_create_require_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4065,7 +4080,7 @@ fn module_create_require_callback(
 
 // ---------- assert ----------
 
-fn throw_assertion_error(scope: &mut v8::HandleScope, message: &str) {
+fn throw_assertion_error(scope: &mut v8::PinScope, message: &str) {
     let error_msg = format!("AssertionError: {}", message);
     let msg = v8::String::new(scope, &error_msg).unwrap();
     let exception = v8::Exception::error(scope, msg);
@@ -4073,7 +4088,7 @@ fn throw_assertion_error(scope: &mut v8::HandleScope, message: &str) {
 }
 
 fn assert_ok_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4092,7 +4107,7 @@ fn assert_ok_callback(
 }
 
 fn assert_equal_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4120,7 +4135,7 @@ fn assert_equal_callback(
 }
 
 fn assert_if_error_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4132,7 +4147,7 @@ fn assert_if_error_callback(
 }
 
 fn assert_fail_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4141,7 +4156,7 @@ fn assert_fail_callback(
 }
 
 fn assert_throws_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4149,10 +4164,11 @@ fn assert_throws_callback(
         let f = args.get(0);
         if let Ok(func) = v8::Local::<v8::Function>::try_from(f) {
             let undefined = v8::undefined(scope);
-            let mut tc = v8::TryCatch::new(scope);
-            let _result = func.call(&mut tc, undefined.into(), &[]);
-            let caught = tc.has_caught();
-            drop(tc);
+            let caught = {
+                v8::tc_scope!(let tc, scope);
+                let _result = func.call(tc, undefined.into(), &[]);
+                tc.has_caught()
+            };
             if !caught {
                 let msg = get_str(scope, args.get(1))
                     .unwrap_or_else(|| "Function expected to throw".to_string());
@@ -4163,7 +4179,7 @@ fn assert_throws_callback(
 }
 
 fn call_first_arg_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4179,7 +4195,7 @@ fn call_first_arg_callback(
 // ---------- child_process ----------
 
 fn cp_spawn_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4235,7 +4251,7 @@ fn cp_spawn_sync_callback(
 }
 
 fn run_cmd_and_set_result(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     mut command: std::process::Command,
     rv: &mut v8::ReturnValue,
 ) {
@@ -4275,7 +4291,7 @@ fn run_cmd_and_set_result(
 }
 
 fn cp_exec_sync_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4298,7 +4314,7 @@ fn cp_exec_sync_callback(
 }
 
 fn cp_spawn_unsupported_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4311,7 +4327,7 @@ fn cp_spawn_unsupported_callback(
 // ---------- tty ----------
 
 fn tty_isatty_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4321,7 +4337,7 @@ fn tty_isatty_callback(
 // ---------- crypto ----------
 
 fn crypto_hash_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4340,7 +4356,7 @@ thread_local! {
 }
 
 fn crypto_hash_update_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4348,7 +4364,7 @@ fn crypto_hash_update_callback(
 }
 
 fn crypto_hash_digest_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4359,7 +4375,7 @@ fn crypto_hash_digest_callback(
 }
 
 fn crypto_random_bytes_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4380,7 +4396,7 @@ fn crypto_random_bytes_callback(
 }
 
 fn crypto_random_uuid_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4403,7 +4419,7 @@ fn crypto_random_uuid_callback(
 // ---------- stream stubs ----------
 
 fn stream_stub_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4423,7 +4439,7 @@ fn stream_stub_callback(
 // ---------- process helpers ----------
 
 fn process_cwd_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4433,7 +4449,7 @@ fn process_cwd_callback(
 }
 
 fn process_exit_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4452,7 +4468,7 @@ fn process_exit_callback(
 }
 
 fn process_hrtime_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4470,7 +4486,7 @@ fn process_hrtime_callback(
 }
 
 fn process_hrtime_bigint_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4482,7 +4498,7 @@ fn process_hrtime_bigint_callback(
 }
 
 fn stdout_write_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4496,7 +4512,7 @@ fn stdout_write_callback(
 }
 
 fn stderr_write_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4512,7 +4528,7 @@ fn stderr_write_callback(
 // ---------- TextEncoder / TextDecoder ----------
 
 fn text_decoder_ctor_callback<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4527,7 +4543,7 @@ fn text_decoder_ctor_callback<'s>(
 }
 
 fn text_decoder_decode_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4546,7 +4562,7 @@ fn text_decoder_decode_callback(
 }
 
 fn text_encoder_ctor_callback<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4559,7 +4575,7 @@ fn text_encoder_ctor_callback<'s>(
 }
 
 fn text_encoder_encode_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4579,7 +4595,7 @@ fn text_encoder_encode_callback(
 }
 
 fn text_encoder_encode_into_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4609,7 +4625,7 @@ fn text_encoder_encode_into_callback(
 // ---------- Buffer / timers / misc ----------
 
 fn buffer_from_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4634,7 +4650,7 @@ fn buffer_from_callback(
 }
 
 fn buffer_is_buffer_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4643,7 +4659,7 @@ fn buffer_is_buffer_callback(
 }
 
 fn set_timer_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4655,7 +4671,7 @@ fn set_timer_callback(
 }
 
 fn returning_this_callback(
-    _scope: &mut v8::HandleScope,
+    _scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -4663,14 +4679,14 @@ fn returning_this_callback(
 }
 
 fn noop_callback(
-    _scope: &mut v8::HandleScope,
+    _scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
 }
 
 fn sync_call_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
@@ -4684,7 +4700,7 @@ fn sync_call_callback(
 }
 
 fn console_log(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -4699,7 +4715,7 @@ fn console_log(
 }
 
 fn console_error(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {

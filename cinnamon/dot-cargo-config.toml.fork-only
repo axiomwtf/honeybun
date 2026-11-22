@@ -1,7 +1,0 @@
-# honeybun build configuration: link V8 from the local Cinnamon fork build.
-# The static lib and FFI binding come from cinnamon/v8's own source build
-# (NUM_JOBS=4 V8_FROM_SOURCE=1 cargo build --release in cinnamon/v8, which
-# runs the rust-v8 build.rs + ninja). See patches/0001-honeybun-v8-gn-args.patch.
-[env]
-RUSTY_V8_ARCHIVE = "/home/void01x/devin/honeybun/cinnamon/v8/target/release/gn_out/obj/librusty_v8.a"
-RUSTY_V8_SRC_BINDING_PATH = "/home/void01x/devin/honeybun/cinnamon/v8/target/release/gn_out/src_binding.rs"
