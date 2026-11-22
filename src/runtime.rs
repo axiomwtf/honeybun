@@ -455,6 +455,15 @@ impl Runtime {
                 // Use load_main_es_module_from_code to avoid double loading
                 self.engine_has_main.set(true);
                 let t_eval = std::time::Instant::now();
+                // Cold engine: deno_core installs globalThis.Deno only after
+                // the runtime is constructed; mirror argv before any module
+                // code probes it.
+                {
+                    deno_core::scope!(scope, runtime);
+                    let context = scope.get_current_context();
+                    let global = context.global(scope);
+                    sync_deno_args(&global, scope);
+                }
                 let id = match block_on(runtime.load_main_es_module_from_code(&module_specifier, source)) {
                     Ok(id) => id,
                     Err(e) => return (runtime, Err(e).context("failed to load module")),
@@ -489,6 +498,7 @@ impl Runtime {
                 deno_core::scope!(scope, runtime);
                 let context = scope.get_current_context();
                 let global = context.global(scope);
+                sync_deno_args(&global, scope);
                 let require_key = v8::String::new(scope, "require").unwrap();
                 let require_val = global
                     .get(scope, require_key.into())
@@ -807,10 +817,40 @@ fn warm_prepare(runtime: &mut JsRuntime, main_path: &Path) {
         }
         let argv_key = v8::String::new(scope, "argv").unwrap();
         p.set(scope, argv_key.into(), argv.into());
+        // Keep Deno.args in sync with the fresh argv (npm compat scripts
+        // probe `globalThis.Deno ? Deno.args : process.argv`).
+        let context = scope.get_current_context();
+        let global_for_sync = context.global(scope);
+        sync_deno_args(&global_for_sync, scope);
         // exitCode back to 0
         let eck = v8::String::new(scope, "exitCode").unwrap();
         let zero = v8::Number::new(scope, 0.0);
         p.set(scope, eck.into(), zero.into());
+    }
+}
+
+/// deno_core registers `globalThis.Deno` (its internal core ops object). npm
+/// packages probe `globalThis.Deno ? Deno.args : process.argv` (chalk,
+/// has-flag, supports-color, mime) and take the Deno branch whenever the
+/// object exists, so `Deno.args` must mirror `process.argv`. Must be called
+/// AFTER the isolate is fully built: deno_core installs the global late, so a
+/// polyfill during global setup never sticks.
+fn sync_deno_args(global: &v8::Local<v8::Object>, scope: &mut v8::PinScope<'_, '_>) {
+    let dk = v8::String::new(scope, "Deno").unwrap();
+    let dv = global.get(scope, dk.into());
+    if let Some(dv) = dv.and_then(|v| v.to_object(scope)) {
+        let ak = v8::String::new(scope, "args").unwrap();
+        let pk = v8::String::new(scope, "process").unwrap();
+        let avk = v8::String::new(scope, "argv").unwrap();
+        let argv = global
+            .get(scope, pk.into())
+            .and_then(|p| p.to_object(scope))
+            .and_then(|p| p.get(scope, avk.into()));
+        if let Some(argv) = argv {
+            if !argv.is_undefined() {
+                dv.set(scope, ak.into(), argv);
+            }
+        }
     }
 }
 
@@ -836,6 +876,36 @@ impl HoneyModuleLoader {
             || specifier.starts_with("../")
             || specifier.starts_with('/')
             || specifier.starts_with("file:");
+        // Subpath imports ("#foo"): resolved against the "imports" field of
+        // the nearest package.json relative to the referrer (Node semantics),
+        // not the process cwd.
+        if !is_url && !is_pathish && specifier.starts_with('#') {
+            let referrer_dir = ModuleSpecifier::parse(referrer)
+                .ok()
+                .and_then(|u| u.to_file_path().ok())
+                .or_else(|| std::path::PathBuf::from(referrer).canonicalize().ok())
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .or_else(|| std::env::current_dir().ok());
+            let Some(dir) = referrer_dir else {
+                return Err(AnyError::msg(format!("import failed: cannot locate referrer for {}", specifier)));
+            };
+            match resolve_subpath_import(&dir, specifier, true)
+                .and_then(|target| resolve_with_extensions(Path::new(&target)).ok())
+            {
+                Some(path) => {
+                    let url = ModuleSpecifier::from_file_path(PathBuf::from(&path)).map_err(|_| {
+                        anyhow::anyhow!("failed to convert to file URL: {}", path)
+                    })?;
+                    return Ok(url);
+                }
+                None => {
+                    return Err(AnyError::msg(format!(
+                        "import failed: package not found: {} (no matching entry in the nearest package.json \"imports\" field)",
+                        specifier
+                    )));
+                }
+            }
+        }
         if !is_url && !is_pathish && !specifier.starts_with("node:") {
             match resolve_module_path_prefer(specifier, true) {
                 Ok(path) => {
@@ -995,6 +1065,14 @@ impl ModuleLoader for HoneyModuleLoader {
                 ))));
             }
         };
+
+        // Native addons: fail loudly (see the CJS path comment).
+        if path.extension().map(|e| e == "node").unwrap_or(false) {
+            return ModuleLoadResponse::Sync(Err(deno_error::JsErrorBox::generic(format!(
+                "native addon '{}' cannot be loaded: honey does not implement the Node N-API runtime layer yet (tracked for v0.2; see SPEC.md §6)",
+                path.display()
+            ))));
+        }
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -1044,20 +1122,367 @@ fn strip_shebang(source: &str) -> String {
 }
 
 fn wrap_commonjs_if_needed(source: &str, path: &Path) -> String {
-    // Genuinely ESM files load as-is.
-    let is_mjs = path.extension().map(|e| e == "mjs").unwrap_or(false);
-    if is_mjs || looks_like_esm(source) {
+    // Genuinely ESM files load as-is. Explicit .cjs files are CommonJS
+    // regardless of any package "type" field.
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext == "mjs" || (ext != "cjs" && looks_like_esm(source)) {
         return source.to_string();
     }
 
     // CommonJS: evaluate through the require machinery (which provides
-    // module/exports and a correctly-anchored require) and expose both the
-    // module.exports as default and, where resolvable, named exports.
+    // module/exports and a correctly-anchored require), expose the
+    // module.exports as default, and — like cjs-module-lexer — detect
+    // statically-declarable named exports so
+    // `import { renderToString } from "react-dom/server"` links.
     let file_path = path.to_string_lossy().replace('\\', "\\\\").replace('\'', "\\'");
-    format!(
+    let detected = detect_cjs_named_exports(&strip_js_comments(source));
+    let mut out = format!(
         "const __honey_cjs = globalThis.require('{}');\nexport default __honey_cjs;\n",
         file_path
+    );
+    for name in &detected {
+        // `__honey_cjs` always exists at this point: the require call above.
+        out.push_str(&format!("export const {{{name}: {name}}} = __honey_cjs;\n", name = name));
+    }
+    out
+}
+
+/// Statically detect named exports from CommonJS source (cjs-module-lexer
+/// subset): `exports.Name =`, `exports["Name"] =`, `module.exports.Name =`,
+/// `module.exports["Name"] =`, and the first-level keys of a plain
+/// `module.exports = { ... }` literal. Never evaluates; string-scan only.
+fn detect_cjs_named_exports(source: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+
+    fn push_candidate(name: &str, out: &mut Vec<String>) {
+        if is_exportable_ident(name) && !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+
+    for line in source.lines() {
+        let t = line.trim_start();
+        // `exports.Name =` / `exports["Name"] =`
+        if t.starts_with("exports.") || t.starts_with("exports[") {
+            if let Some(rest) = t.strip_prefix("exports") {
+                if let Some(name) = property_assign_name(rest) {
+                    push_candidate(&name, &mut found);
+                }
+            }
+        }
+        // `module.exports.Name =` / `module.exports["Name"] =`
+        if t.starts_with("module.exports") {
+            if let Some(rest) = t.strip_prefix("module.exports") {
+                if let Some(name) = property_assign_name(rest) {
+                    push_candidate(&name, &mut found);
+                }
+            }
+        }
+    }
+
+    // module.exports = { k: v, "k2": v2, k3 }  (single statement, top level)
+    if let Some(idx) = source.find("module.exports") {
+        // Only when it is a plain assignment to an object literal; every
+        // later patch-style `exports.x =` line is handled above anyway.
+        let rest = source[idx + "module.exports".len()..].trim_start();
+        if let Some(rest) = rest.strip_prefix('=') {
+            let trimmed = rest.trim_start();
+            if let Some(after_brace) = trimmed.strip_prefix('{') {
+                if let Some(end) = matching_close_brace(after_brace) {
+                    let inner = &after_brace[..end];
+                    for part in inner.split(',') {
+                        if let Some(name) = object_key_name(part.trim()) {
+                            push_candidate(&name, &mut found);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// From text immediately following the `exports`/`module.exports` token,
+/// recognize `.Name =` or `["Name"] =` and return the property name.
+fn property_assign_name(rest: &str) -> Option<String> {
+    let rest = rest.trim_start();
+    if let Some(after) = rest.strip_prefix('.') {
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+            .collect();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(name);
+    }
+    if let Some(after) = rest.strip_prefix('[') {
+        let after = after.trim_start();
+        let quote = after.chars().next()?;
+        if quote != '\'' && quote != '"' {
+            return None;
+        }
+        let after = &after[1..];
+        let end = after.char_indices().find(|(_, c)| *c == quote).map(|(i, _)| i)?;
+        let name = &after[..end];
+        // Computed brackets are not statically declarable; only quoted plain
+        // identifiers count.
+        return Some(name.to_string()).filter(|n| is_exportable_ident(n));
+    }
+    None
+}
+
+/// First-level key of an object-literal entry: `name:` / `"name":` /
+/// `'name':`, or a shorthand bare `name`.
+fn object_key_name(part: &str) -> Option<String> {
+    if let Some(colon) = part.find(':') {
+        let key = part[..colon].trim();
+        let key = key.trim_matches(|c| c == '\'' || c == '"');
+        return Some(key.to_string()).filter(|n| is_exportable_ident(n));
+    }
+    Some(part.trim().to_string()).filter(|n| is_exportable_ident(n))
+}
+
+/// The index of the `}` matching the (already consumed) leading `{` of `s`,
+/// respecting quotes and escapes. Bounded to 16 KB to stay cheap on
+/// pathological files.
+fn matching_close_brace(s: &str) -> Option<usize> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut depth: i32 = 1;
+    let mut in_str: Option<char> = None;
+    let mut i = 0usize;
+    while i < chars.len() && i < 16384 {
+        let c = chars[i];
+        match in_str {
+            Some(q) => {
+                if c == '\\' {
+                    i += 1;
+                } else if c == q {
+                    in_str = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' | '`' => in_str = Some(c),
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A name usable as an ES module export binding: an identifier that is not a
+/// reserved word.
+fn is_exportable_ident(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_alphabetic() || first == '_' || first == '$') {
+        return false;
+    }
+    if !chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+        return false;
+    }
+    !is_reserved_word(s)
+}
+
+/// Reserved JS words (subset relevant to export name validity — a reserved
+/// word cannot be a named binding target).
+fn is_reserved_word(s: &str) -> bool {
+    matches!(
+        s,
+        "default"
+            | "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+            | "let"
+            | "static"
+            | "implements"
+            | "interface"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
     )
+}
+
+/// Strip `// line` and `/* block */` comments, string- and regex-aware, so
+/// the line-based ESM→CJS transformer never sees comment text swallowing a
+/// statement's remainder. `//` inside a regex literal is preserved.
+fn strip_js_comments(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    // Track the last significant (non-space) char for regex-literal detection.
+    let mut last_significant: Option<char> = None;
+    let mut last_word = String::new(); // keyword before the regex literal
+    let mut state = 0u8; // 0 normal, 1 line comment, 2 block comment, 3 'str, 4 "str, 5 `tpl`
+    while i < chars.len() {
+        let c = chars[i];
+        match state {
+            0 => {
+                if c == '/' && i + 1 < chars.len() {
+                    let n = chars[i + 1];
+                    if n == '/' {
+                        state = 1;
+                        i += 2;
+                        continue;
+                    }
+                    if n == '*' {
+                        state = 2;
+                        i += 2;
+                        continue;
+                    }
+                    // Regex literal? Only when division is not plausible.
+                    if regex_allowed(last_significant.as_ref(), &last_word) {
+                        out.push(c);
+                        i += 1;
+                        let mut in_class = false; // [..] inside the regex
+                        while i < chars.len() {
+                            let rc = chars[i];
+                            if rc == '\\' && i + 1 < chars.len() {
+                                out.push(rc);
+                                out.push(chars[i + 1]);
+                                i += 2;
+                                continue;
+                            }
+                            out.push(rc);
+                            if rc == '[' {
+                                in_class = true;
+                            } else if rc == ']' {
+                                in_class = false;
+                            } else if rc == '/' && !in_class {
+                                break;
+                            } else if rc == '\n' {
+                                break; // not actually a regex; give up on the line
+                            }
+                            i += 1;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                }
+                if c == '\'' {
+                    state = 3;
+                } else if c == '"' {
+                    state = 4;
+                } else if c == '`' {
+                    state = 5;
+                }
+                if c.is_alphanumeric() || c == '_' || c == '$' {
+                    last_word.push(c);
+                } else {
+                    last_word.clear();
+                }
+                if !c.is_whitespace() {
+                    last_significant = Some(c);
+                    last_word.truncate(64);
+                }
+                out.push(c);
+            }
+            1 => {
+                if c == '\n' {
+                    state = 0;
+                    out.push('\n');
+                }
+            }
+            2 => {
+                if c == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    state = 0;
+                    i += 2;
+                    continue;
+                }
+                if c == '\n' {
+                    out.push('\n'); // keep line numbers stable
+                }
+            }
+            3 | 4 | 5 => {
+                let quote = match state {
+                    3 => '\'',
+                    4 => '"',
+                    _ => '`',
+                };
+                out.push(c);
+                if c == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if c == quote {
+                    state = 0;
+                    last_significant = Some('x'); // closing quote: not a regex position
+                    last_word.clear();
+                } else if state == 5 && c == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
+                    // Interpolation: let the normal state machine run inside.
+                    // (Approximation: nested template depth isn't tracked.)
+                }
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Is a `/` at this position a regex literal start (yes when the previous
+/// significant context cannot end an expression)?
+fn regex_allowed(last_significant: Option<&char>, last_word: &str) -> bool {
+    match last_significant {
+        None => true,
+        Some(c) => {
+            match c {
+                '(' | ',' | '=' | ':' | '[' | '!' | '&' | '|' | '?' | '{' | '}' | ';' | '+' | '*' | '%' | '~' | '^' | '<' | '>' | '-' | '/' | '\n' => true,
+                ')' | ']' => false,
+                _ => {
+                    // `return /re/`, `typeof /re/`, `case /re/`
+                    matches!(last_word, "return" | "typeof" | "case" | "in" | "of" | "new" | "delete" | "void" | "do" | "else")
+                }
+            }
+        }
+    }
 }
 
 fn global_object_middleware(
@@ -1533,6 +1958,80 @@ fn looks_like_esm(source: &str) -> bool {
     false
 }
 
+/// Multi-line statements (an `import { a, b } from '...'` spilled over
+/// several lines) are merged with '\n' so downstream single-statement
+/// handling (strip_prefix/rfind logic) sees one coherent text.
+fn accumulate_esm_statements(source: &str) -> Vec<String> {
+    let mut stmts: Vec<String> = Vec::new();
+    let lines: Vec<&str> = source.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+        if esm_stmt_continues(t) {
+            let mut joined = t.to_string();
+            while esm_stmt_open(&joined) && i + 1 < lines.len() {
+                i += 1;
+                joined.push('\n');
+                joined.push_str(lines[i].trim());
+            }
+            stmts.push(joined);
+        } else {
+            stmts.push(lines[i].to_string());
+        }
+        i += 1;
+    }
+    stmts
+}
+
+/// True when this line starts an import/export statement whose clause could
+/// continue on following lines.
+fn esm_stmt_continues(t: &str) -> bool {
+    if !t.starts_with("import") && !t.starts_with("export") {
+        return false;
+    }
+    if t.starts_with("import(") || t.starts_with("import.meta") {
+        return false; // dynamic imports / meta stay CJS-legal one-liners
+    }
+    // A `;`-terminated single-line statement isn't open even if braces are
+    // balanced; Open means unbalanced bracket depth reduces the clause.
+    esm_stmt_open(t)
+}
+
+/// Bracket-depth check ignoring string/template contents. Open (true) = the
+/// final bracket context is unclosed.
+fn esm_stmt_open(s: &str) -> bool {
+    let mut depth: i32 = 0;
+    let mut in_str: Option<char> = None;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match in_str {
+            Some(q) => {
+                if c == '\\' {
+                    i += 1;
+                } else if c == q {
+                    in_str = None;
+                    if q != '`' && depth == 0 {
+                        return false; // quoted spec ending the statement
+                    }
+                } else if q == '`' && c == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
+                    // Approximation: templates with ${} stay "string" for the
+                    // purposes of bracket counting.
+                }
+            }
+            None => match c {
+                '\'' | '"' | '`' => in_str = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    depth > 0
+}
+
 /// Best-effort ESM -> CJS transform for require() of ESM files. Handles the
 /// shapes produced by typical bundlers: static imports (single-line),
 /// `export default X;`, `export const/let/var/function/class Name`,
@@ -1544,7 +2043,16 @@ pub(crate) fn transform_esm_to_cjs(source: &str) -> String {
     let mut default_only = !source.contains("module.exports");
 
     let mut out: Vec<String> = Vec::new();
-    for line in source.lines() {
+    // Snapshot the original exports object: files like zod's en.cjs-style
+    // patterns (`module.exports = fn`) reassign module.exports; trailing
+    // interop assignments must never decorate that reassigned value.
+    out.push("const __honey_orig_exports = module.exports;".to_string());
+    // Comments and multi-line import/export statements (chalk-style
+    // `import { // eslint ... \n a, \n b \n} from '...'`) are joined into
+    // single logical statements so the line-based transform below never
+    // sees a dangling clause. Comments are stripped first — a `//` comment
+    // on the opening line would otherwise swallow the statement's tail.
+    for line in accumulate_esm_statements(&strip_js_comments(source)) {
         let t = line.trim_start();
         if t.starts_with("import ") || t.starts_with("import{") || t.starts_with("import *") || t.starts_with("import*") {
             if t.starts_with("import(") {
@@ -1564,47 +2072,74 @@ pub(crate) fn transform_esm_to_cjs(source: &str) -> String {
                 let mut bindings: Vec<(String, String)> = Vec::new(); // (local, imported)
                 if let Some(rest) = clause.strip_prefix('*') {
                     // import * as N
-                    let n = rest.trim().trim_start_matches("as").trim().to_string();
-                    out.push(format!("const {} = require('{}');", n, src_part));
                 } else {
-                    let mut named_part = clause;
-                    // default binding before a comma?
-                    if let Some(idx) = clause.find(',') {
-                        let d = clause[..idx].trim();
-                        if !d.is_empty() {
-                            has_default = true;
-                            out.push(format!(
-                                "const {d} = (() => {{ const __m = require('{p}'); return (__m && typeof __m === 'object' && 'default' in __m) ? __m.default : __m; }})();",
-                                d = d, p = src_part
-                            ));
-                        }
-                        named_part = clause[idx + 1..].trim();
-                    }
-                    if let Some(inner) = named_part.strip_prefix('{') {
-                        let inner = inner.trim_end_matches('}').trim();
-                        if !inner.is_empty() {
-                            let mut destructured = String::new();
-                            for (i, pair) in inner.split(',').enumerate() {
-                                let pair = pair.trim();
-                                if pair.is_empty() { continue; }
-                                if i > 0 { destructured.push_str(", "); }
-                                destructured.push_str(pair);
-                                let (local, imported) = match pair.split_once(" as ") {
-                                    Some((imp, loc)) => (loc.trim().to_string(), imp.trim().to_string()),
-                                    None => (pair.to_string(), pair.to_string()),
-                                };
-                                bindings.push((local, imported));
-                            }
-                            if !destructured.is_empty() {
-                                out.push(format!("const {{ {} }} = require('{}');", destructured, src_part));
-                            }
-                        }
-                    } else if !has_default && !clause.is_empty() {
-                        // import X from (single default)
+                    fn emit_default(
+                        out: &mut Vec<String>,
+                        d: &str,
+                        src_part: &str,
+                    ) {
                         out.push(format!(
                             "const {d} = (() => {{ const __m = require('{p}'); return (__m && typeof __m === 'object' && 'default' in __m) ? __m.default : __m; }})();",
-                            d = clause, p = src_part
+                            d = d, p = src_part
                         ));
+                    }
+                    fn emit_named(
+                        out: &mut Vec<String>,
+                        bindings: &mut Vec<(String, String)>,
+                        part: &str,
+                        src_part: &str,
+                    ) {
+                        let Some(inner) = part.strip_prefix('{') else { return };
+                        let inner_end = inner.rfind('}');
+                        let inner = match inner_end {
+                            Some(e) => &inner[..e],
+                            None => inner,
+                        };
+                        let inner = inner.trim();
+                        if inner.is_empty() {
+                            return;
+                        }
+                        let mut destructured = String::new();
+                        for pair in inner.split(',') {
+                            let pair = pair.trim();
+                            if pair.is_empty() { continue; }
+                            if !destructured.is_empty() { destructured.push_str(", "); }
+                            destructured.push_str(pair);
+                            let (local, imported) = match pair.split_once(" as ") {
+                                Some((imp, loc)) => (loc.trim().to_string(), imp.trim().to_string()),
+                                None => (pair.to_string(), pair.to_string()),
+                            };
+                            bindings.push((local, imported));
+                        }
+                        if !destructured.is_empty() {
+                            out.push(format!("const {{ {} }} = require('{}');", destructured, src_part));
+                        }
+                    }
+                    match clause.find('{') {
+                        Some(bi) => {
+                            // Default binding(s) before the '{' clause.
+                            if bi > 0 {
+                                let d = clause[..bi].trim().trim_end_matches(',').trim_end();
+                                if !d.is_empty() {
+                                    has_default = true;
+                                    emit_default(&mut out, d, &src_part);
+                                }
+                            }
+                            emit_named(&mut out, &mut bindings, clause[bi..].trim(), &src_part);
+                        }
+                        None => {
+                            // No named clause: default import(s).
+                            if let Some(idx) = clause.find(',') {
+                                let d = clause[..idx].trim().trim_end_matches(',').trim_end();
+                                if !d.is_empty() {
+                                    has_default = true;
+                                    emit_default(&mut out, d, &src_part);
+                                }
+                            } else if !clause.is_empty() {
+                                has_default = true;
+                                emit_default(&mut out, clause, &src_part);
+                            }
+                        }
                     }
                 }
                 continue;
@@ -1622,7 +2157,7 @@ pub(crate) fn transform_esm_to_cjs(source: &str) -> String {
                 if name.is_empty() { None } else { Some(name) }
             });
             if let Some(n) = decl_named {
-                out.push(line.strip_prefix("export").unwrap_or(line).to_string());
+                out.push(line.strip_prefix("export").unwrap_or("").to_string());
                 default_binding = Some(n);
                 default_only = false;
             } else if rest.ends_with(';') || rest.is_empty() {
@@ -1638,7 +2173,9 @@ pub(crate) fn transform_esm_to_cjs(source: &str) -> String {
             // export block on one line
             if let Some(inner) = t.find('{').map(|i| &t[i + 1..]) {
                 let inner = inner.split('}').next().unwrap_or("");
-                out.push(format!("// esm->cjs: {}", t));
+                // The joined statement may span lines; a bare `//` comment
+                // would leave its tail as live code.
+                out.push(format!("// esm->cjs: {}", t.replace('\n', " ").replace('\r', " ")));
                 for pair in inner.split(',') {
                     let pair = pair.trim();
                     if pair.is_empty() { continue; }
@@ -1727,14 +2264,27 @@ pub(crate) fn transform_esm_to_cjs(source: &str) -> String {
         return out.join("\n");
     }
     for (name, binding) in &names {
-        out.push(format!("module.exports[\"{}\"] = {};", name, binding));
+        out.push(format!(
+            "if (module.exports === __honey_orig_exports) module.exports[\"{}\"] = {};",
+            name, binding
+        ));
     }
     if let Some(d) = &default_binding {
-        out.push(format!("module.exports[\"default\"] = {};", d));
+        out.push(format!(
+            "if (module.exports === __honey_orig_exports) module.exports[\"default\"] = {};",
+            d
+        ));
     }
-    out.push("module.exports.__esModule = true;".to_string());
+    out.push("if (module.exports === __honey_orig_exports) module.exports.__esModule = true;"
+        .to_string());
     out.push(String::new());
     out.join("\n")
+}
+
+/// Debug entry for --internal-transform-js: prints the ESM->CJS transform
+/// output for a source file without running the engine.
+pub fn transform_esm_to_cjs_debug(source: &str) -> String {
+    transform_esm_to_cjs(source)
 }
 
 /// TypeScript entry points honey transpiles: .ts, .mts, .cts.
@@ -1990,6 +2540,8 @@ const BUILTIN_NAMES: &[&str] = &[
     "worker_threads", "stream", "stream/promises", "child_process", "tty", "string_decoder",
     "crypto", "zlib", "http", "https", "net", "dns", "tls", "vm", "repl",
     "constants", "trace_events", "async_hooks", "buffer",
+    "querystring", "readline", "perf_hooks",
+    "process",
 ];
 
 fn is_builtin_name(name: &str) -> bool {
@@ -2013,8 +2565,13 @@ fn builtin_export_list(name: &str) -> &'static [&'static str] {
             "rm", "unlink", "copyFile", "realpath", "appendFile",
         ],
         "os" => &["platform", "arch", "homedir", "tmpdir", "hostname", "type", "release", "EOL"],
-        "util" => &["inspect", "format", "inherits", "promisify", "deprecate", "debuglog", "types", "styleText", "stripVTControlCharacters"],
+        "util" => &["inspect", "format", "inherits", "promisify", "deprecate", "debuglog", "types", "styleText", "stripVTControlCharacters", "TextEncoder", "TextDecoder"],
         "url" => &["pathToFileURL", "fileURLToPath"],
+        "process" => &[
+            "argv", "env", "platform", "arch", "version", "versions", "pid", "ppid",
+            "exit", "exitCode", "cwd", "chdir", "nextTick", "hrtime", "stdout", "stderr",
+            "stdin", "on", "off", "kill", "memoryUsage", "uptime", "execPath", "execArgv",
+        ],
         "module" => &["enableCompileCache", "disableCompileCache", "createRequire", "_resolveFilename"],
         "events" => &["EventEmitter", "once"],
         "worker_threads" => &["isMainThread", "threadId", "parentPort"],
@@ -2026,11 +2583,15 @@ fn builtin_export_list(name: &str) -> &'static [&'static str] {
         "crypto" => &["createHash", "randomBytes", "randomUUID"],
         "tty" => &["isatty"],
         "stream" | "stream/promises" | "zlib" | "http" | "https" | "net" | "dns" | "tls"
-        | "vm" | "repl" | "string_decoder" | "trace_events" | "async_hooks" => &[
+        | "vm" | "repl" | "string_decoder" | "trace_events" => &[
             "Readable", "Writable", "Duplex", "Transform", "PassThrough", "pipeline",
             "finished",
         ],
+        "async_hooks" => &["AsyncLocalStorage", "AsyncResource", "executionAsyncId", "createHook"],
         "buffer" => &["from", "isBuffer"],
+        "querystring" => &["parse", "stringify", "escape", "unescape"],
+        "readline" => &["createInterface"],
+        "perf_hooks" => &["performance", "monitorEventLoopDelay"],
         "constants" => &[],
         _ => &[],
     }
@@ -2214,6 +2775,20 @@ fn require_module_internal(
         return;
     }
 
+    // Native addons: a real N-API runtime layer is tracked (SPEC §6 v0.2);
+    // until it lands, fail loudly and clearly instead of letting a binary
+    // blob hit the JS source reader and produce a baffling syntax error.
+    if resolved.ends_with(".node") {
+        let error_msg = format!(
+            "native addon '{}' cannot be loaded: honey does not implement the Node N-API runtime layer yet (tracked for v0.2; see SPEC.md §6)",
+            resolved
+        );
+        let msg = v8::String::new(scope, &error_msg).unwrap();
+        let exception = v8::Exception::error(scope, msg);
+        scope.throw_exception(exception);
+        return;
+    }
+
     let source = match std::fs::read_to_string(&resolved) {
         Ok(s) => s,
         Err(e) => {
@@ -2248,14 +2823,20 @@ fn require_module_internal(
 
     // If the file is an ES module, transform it to CJS so require() also works
     // on ESM-only packages (mirrors Node's require(esm) interop).
-    let source = if resolved.ends_with(".mjs")
-        || nearest_package_json_is_module(Path::new(&resolved))
-        || looks_like_esm(&source)
-    {
-        transform_esm_to_cjs(&source)
-    } else {
-        source
+    let source = {
+        // Explicit .cjs files are CommonJS regardless of package "type".
+        let transformed = !resolved.ends_with(".cjs")
+            && (resolved.ends_with(".mjs")
+                || nearest_package_json_is_module(Path::new(&resolved))
+                || looks_like_esm(&source));
+        if transformed {
+            transform_esm_to_cjs(&source)
+        } else {
+            source.clone()
+        }
     };
+
+    // Set up module context
 
     // Set up module context
     let module_dir = Path::new(&resolved)
@@ -2457,6 +3038,26 @@ fn resolve_module_path_prefer(module_name: &str, prefer_import: bool) -> Result<
     let cwd = std::env::current_dir()
         .context("failed to get current directory")?;
 
+    // Subpath imports ("#ansi-styles", "#pkg/*"): resolved against the
+    // "imports" field of the nearest package.json (Node's package-imports
+    // map), relative to the requiring module's directory.
+    if module_name.starts_with('#') {
+        let base_dir = MODULE_DIR.with(|d| d.borrow().clone());
+        let dir = if base_dir.as_os_str().is_empty() { cwd.clone() } else { base_dir };
+        return resolve_subpath_import(&dir, module_name, prefer_import)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "package not found: {} (no matching entry in the nearest package.json \"imports\" field)",
+                    module_name
+                )
+            })
+            .and_then(|target| {
+                resolve_with_extensions(Path::new(&target)).map_err(|e| {
+                    anyhow::anyhow!("package not found: {} (imports target resolved to {}): {}", module_name, target, e)
+                })
+            });
+    }
+
     if module_name.starts_with('.') || module_name.starts_with('/') {
         let path = Path::new(module_name);
         let resolved = if path.is_absolute() {
@@ -2501,24 +3102,43 @@ fn resolve_module_path_prefer(module_name: &str, prefer_import: bool) -> Result<
     };
 
     let mut last_root = roots.last().cloned().unwrap_or_else(|| cwd.to_path_buf());
+    // Scoped packages: "@scope/pkg" -> pkg_base = "pkg" (the subpath was
+    // already remapped past the scope above).
+    let pkg_base = if pkg_name.starts_with('@') {
+        parts[1].split('/').next().unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
     for root in &roots {
         last_root = root.clone();
-        // honey install layout: versioned dirs (`pkg@<version>`, scoped
-        // encoded with '+') — matched by the `dir_prefix` scan. Fall back to
-        // the standard `node_modules/<pkg>` (or `node_modules/@scope/<pkg>`)
-        // layout written by npm so stock package trees resolve through the
-        // same package.json exports / main / index handling below.
-        let pkg_dir = match std::fs::read_dir(root).ok().and_then(|entries| {
-            let mut found = None;
-            for entry in entries.flatten() {
+        // honey install layout: versioned dirs (`pkg@<version>`; scoped
+        // packages nested as `@scope/<pkg>@<version>`, with the historical
+        // flat `@scope+pkg@<version>` encoding still resolved). Multiple
+        // installed versions pick the highest. Falls back to the standard
+        // `node_modules/<pkg>` (or `node_modules/@scope/<pkg>`) layout
+        // written by npm so stock package trees resolve through the same
+        // package.json exports / main / index handling below.
+        let scan_versioned = |dir: &Path, prefix: &str| -> Option<PathBuf> {
+            let mut best: Option<(Vec<u64>, PathBuf)> = None;
+            for entry in std::fs::read_dir(dir).ok()?.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&dir_prefix) {
-                    found = Some(entry.path());
-                    break;
+                if let Some(ver) = name.strip_prefix(prefix) {
+                    let key = version_sort_key(ver);
+                    if best.as_ref().map(|(k, _)| key > *k).unwrap_or(true) {
+                        best = Some((key, entry.path()));
+                    }
                 }
             }
-            found
-        }) {
+            best.map(|(_, p)| p)
+        };
+        let pkg_dir = match (|| {
+            if pkg_name.starts_with('@') {
+                scan_versioned(&root.join(pkg_name), &format!("{}@", pkg_base))
+                    .or_else(|| scan_versioned(root, &dir_prefix))
+            } else {
+                scan_versioned(root, &dir_prefix)
+            }
+        })() {
             Some(p) => p,
             None => {
                 // Standard layout: the bare package's literal directory name.
@@ -2701,6 +3321,14 @@ fn modules_root_start(cwd: &Path) -> PathBuf {
     if base.as_os_str().is_empty() { cwd.to_path_buf() } else { base }
 }
 
+/// Semver-ish sort key: numeric components (`4.17.21` -> [4,17,21]);
+/// non-numeric parts count as 0 so prerelease tags lose to releases.
+fn version_sort_key(v: &str) -> Vec<u64> {
+    v.split(['.', '-'])
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
 /// Lexically resolve `.` and `..` components. Keeps the path absolute if it
 /// already is; otherwise normalizes the relative form.
 fn lexically_normalize_path(p: &Path) -> PathBuf {
@@ -2730,6 +3358,90 @@ fn lexically_normalize_path(p: &Path) -> PathBuf {
         out.push(".");
     }
     out
+}
+
+/// Nearest package.json walking up from `dir` (Node's package-boundary
+/// search for subpath imports). None when no package root is present.
+fn nearest_package_json_in(dir: &Path) -> Option<PathBuf> {
+    let mut dir = dir.to_path_buf();
+    loop {
+        let candidate = dir.join("package.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Resolve a `#`-specifier (subpath import) against the "imports" map of the
+/// nearest package.json relative to `from_dir`. Returns an absolute target
+/// path (extension resolution is applied by the caller).
+fn resolve_subpath_import(from_dir: &Path, specifier: &str, prefer_import: bool) -> Option<String> {
+    let pkg_path = nearest_package_json_in(from_dir)?;
+    let pkg_dir = pkg_path.parent().unwrap_or(Path::new("."));
+    let content = std::fs::read_to_string(&pkg_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let imports = json.get("imports")?.as_object()?;
+
+    let pick = |target: &serde_json::Value| -> Option<String> {
+        let rel = pick_import_target(target, prefer_import)?;
+        Some(
+            pkg_dir
+                .join(rel.trim_start_matches("./"))
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+
+    // Exact key first, then the longest matching wildcard pattern.
+    if let Some(target) = imports.get(specifier) {
+        return pick(target);
+    }
+    let mut best: Option<(usize, &serde_json::Value)> = None;
+    for (key, target) in imports {
+        let Some(star) = key.find('*') else { continue };
+        let (pre, post) = (&key[..star], &key[star + 1..]);
+        if specifier.len() < pre.len() + post.len()
+            || !specifier.starts_with(pre)
+            || !specifier.ends_with(post)
+        {
+            continue;
+        }
+        let matched_len = specifier.len() - pre.len() - post.len();
+        if best.as_ref().map(|(l, _)| &matched_len > l).unwrap_or(true) {
+            best = Some((matched_len, target));
+        }
+    }
+    let (_, target) = best?;
+    pick(target)
+}
+
+/// Resolve a package.json "imports" entry to its path target, honoring
+/// condition objects (require/import/node/default) and fallback arrays, like
+/// Node's PACKAGE_IMPORTS_RESOLVE.
+fn pick_import_target(target: &serde_json::Value, prefer_import: bool) -> Option<String> {
+    if target.is_string() {
+        return Some(target.as_str()?.to_string());
+    }
+    if let Some(arr) = target.as_array() {
+        return arr.iter().find_map(|t| pick_import_target(t, prefer_import));
+    }
+    let obj = target.as_object()?;
+    let conditions: [&str; 3] = if prefer_import {
+        ["import", "node", "default"]
+    } else {
+        ["require", "node", "default"]
+    };
+    for cond in conditions {
+        if let Some(t) = obj.get(cond) {
+            if let Some(p) = pick_import_target(t, prefer_import) {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 fn resolve_with_extensions(path: &Path) -> Result<String> {
@@ -2849,6 +3561,20 @@ fn get_builtin_module<'s>(
             module.set(scope, types_key.into(), types.into());
             set_function(scope, &module, "styleText", util_style_text_callback);
             set_function(scope, &module, "stripVTControlCharacters", util_strip_vt_callback);
+            // TextEncoder/TextDecoder live as globals; re-export on the util
+            // namespace (React DOM and friends do `util.TextEncoder`).
+            {
+                let ctx = scope.get_current_context();
+                let global = ctx.global(scope);
+                for name in ["TextEncoder", "TextDecoder"] {
+                    let key = v8::String::new(scope, name).unwrap();
+                    if let Some(val) = global.get(scope, key.into()) {
+                        if !val.is_undefined() {
+                            module.set(scope, key.into(), val);
+                        }
+                    }
+                }
+            }
             Some(module.into())
         }
         "url" => {
@@ -2887,15 +3613,61 @@ fn get_builtin_module<'s>(
             set_function(scope, &module, "setEnvironmentData", noop_callback);
             Some(module.into())
         }
+        "querystring" => {
+            let obj = eval_js_source(scope, QUERYSTRING_JS)?;
+            let obj: v8::Local<v8::Object> = match obj.try_into() {
+                Ok(o) => o,
+                Err(_) => return None,
+            };
+            for key in ["parse", "stringify", "escape", "unescape"] {
+                let k = v8::String::new(scope, key).unwrap();
+                let v = obj.get(scope, k.into()).unwrap();
+                module.set(scope, k.into(), v);
+            }
+            Some(module.into())
+        }
+        "readline" => {
+            // Structural shim over the same EventEmitter used by `events`:
+            // createInterface yields an interface object with the standard
+            // surface. Interactive 'line' delivery from stdin is not wired
+            // up yet (no async stdin pump in the runtime).
+            let obj = eval_js_source(scope, READLINE_JS)?;
+            let obj: v8::Local<v8::Object> = match obj.try_into() {
+                Ok(o) => o,
+                Err(_) => return None,
+            };
+            let ci_key = v8::String::new(scope, "createInterface").unwrap();
+            let ci = obj.get(scope, ci_key.into()).unwrap();
+            module.set(scope, ci_key.into(), ci);
+            let default_key = v8::String::new(scope, "default").unwrap();
+            module.set(scope, default_key.into(), ci);
+            Some(module.into())
+        }
+        "perf_hooks" => {
+            let obj = eval_js_source(scope, PERF_HOOKS_JS)?;
+            let obj: v8::Local<v8::Object> = match obj.try_into() {
+                Ok(o) => o,
+                Err(_) => return None,
+            };
+            for key in ["performance", "monitorEventLoopDelay", "nodeTiming", "constants"] {
+                let k = v8::String::new(scope, key).unwrap();
+                let v = obj.get(scope, k.into()).unwrap();
+                module.set(scope, k.into(), v);
+            }
+            Some(module.into())
+        }
         "assert" => {
             set_function(scope, &module, "ok", assert_ok_callback);
             set_function(scope, &module, "strict", assert_ok_callback);
             set_function(scope, &module, "default", assert_ok_callback);
             set_function(scope, &module, "equal", assert_equal_callback);
-            set_function(scope, &module, "deepEqual", assert_equal_callback);
-            set_function(scope, &module, "strictEqual", assert_equal_callback);
-            set_function(scope, &module, "notEqual", noop_callback);
-            set_function(scope, &module, "notDeepEqual", noop_callback);
+            set_function(scope, &module, "deepEqual", assert_deep_equal_callback);
+            set_function(scope, &module, "strictEqual", assert_strict_equal_callback);
+            set_function(scope, &module, "deepStrictEqual", assert_deep_strict_equal_callback);
+            set_function(scope, &module, "notEqual", assert_not_equal_callback);
+            set_function(scope, &module, "notDeepEqual", assert_not_deep_equal_callback);
+            set_function(scope, &module, "notStrictEqual", assert_not_strict_equal_callback);
+            set_function(scope, &module, "notDeepStrictEqual", assert_not_deep_strict_equal_callback);
             set_function(scope, &module, "ifError", assert_if_error_callback);
             set_function(scope, &module, "fail", assert_fail_callback);
             set_function(scope, &module, "throws", assert_throws_callback);
@@ -2929,8 +3701,28 @@ fn get_builtin_module<'s>(
             set_function(scope, &module, "randomUUID", crypto_random_uuid_callback);
             Some(module.into())
         }
+        "async_hooks" => {
+            // Synchronous AsyncLocalStorage: run()/getStore()/enterWith()
+            // with a per-instance stack slot. Sufficient for library code
+            // that uses ALS as request context within one synchronous
+            // execution path (React DOM server does exactly this).
+            let obj = eval_js_source(scope, ASYNC_HOOKS_JS)?;
+            let obj: v8::Local<v8::Object> = match obj.try_into() {
+                Ok(o) => o,
+                Err(_) => return None,
+            };
+            for key in ["AsyncLocalStorage", "AsyncResource", "executionAsyncId", "createHook"] {
+                let k = v8::String::new(scope, key).unwrap();
+                if let Some(v) = obj.get(scope, k.into()) {
+                    module.set(scope, k.into(), v);
+                }
+            }
+            let default_key = v8::String::new(scope, "default").unwrap();
+            module.set(scope, default_key.into(), module.into());
+            Some(module.into())
+        }
         "stream" | "stream/promises" | "zlib" | "http" | "https" | "net" | "dns" | "tls"
-        | "vm" | "repl" | "string_decoder" | "trace_events" | "async_hooks" => {
+        | "vm" | "repl" | "string_decoder" | "trace_events" => {
             // Minimal stream constructor stubs so `class Foo extends Readable`
             // style usage surfaces a clear error at construct-time instead of import-time
             set_function(scope, &module, "Readable", stream_stub_callback);
@@ -2943,6 +3735,17 @@ fn get_builtin_module<'s>(
             Some(module.into())
         }
         "fs/promises" => Some(make_fs_promises_module(scope).into()),
+        "process" => {
+            // The global process object is fully constructed during snapshot
+            // creation / runtime setup; expose it as the module.
+            let context = scope.get_current_context();
+            let global = context.global(scope);
+            let pk = v8::String::new(scope, "process").unwrap();
+            match global.get(scope, pk.into()) {
+                Some(v) if v.is_object() => Some(v),
+                _ => Some(module.into()),
+            }
+        }
         "buffer" | "constants" => Some(module.into()),
         _ => None,
     }
@@ -2978,6 +3781,191 @@ fn fs_promise_unsupported_callback(
     let exception = v8::Exception::error(scope, msg);
     scope.throw_exception(exception);
 }
+
+// querystring: pure-JS shim over the same encoder semantics as Node
+// (application/x-www-form-urlencoded, RFC 3986 sep/eq configurable).
+const ASYNC_HOOKS_JS: &str = r#"
+(function () {
+  "use strict";
+  function AsyncLocalStorage() {
+    this._store = null;
+    this._enabled = true;
+  }
+  AsyncLocalStorage.prototype.run = function (store, callback) {
+    var prev = this._store;
+    this._store = store;
+    try {
+      return callback.apply(null, Array.prototype.slice.call(arguments, 2));
+    } finally {
+      this._store = prev;
+    }
+  };
+  AsyncLocalStorage.prototype.exit = function (callback) {
+    var prev = this._store;
+    this._store = null;
+    try {
+      return callback.apply(null, Array.prototype.slice.call(arguments, 1));
+    } finally {
+      this._store = prev;
+    }
+  };
+  AsyncLocalStorage.prototype.getStore = function () {
+    return this._enabled ? this._store : undefined;
+  };
+  AsyncLocalStorage.prototype.enterWith = function (store) {
+    this._store = store;
+  };
+  AsyncLocalStorage.prototype.disable = function () {
+    this._enabled = false;
+    this._store = null;
+  };
+  function AsyncResource(type) {
+    this.type = type;
+  }
+  AsyncResource.prototype.runInAsyncScope = function (fn, thisArg) {
+    return fn.apply(thisArg, Array.prototype.slice.call(arguments, 2));
+  };
+  AsyncResource.prototype.bind = function (fn) {
+    return fn.bind(this);
+  };
+  AsyncResource.prototype.asyncId = function () { return 0; };
+  AsyncResource.prototype.triggerAsyncId = function () { return 0; };
+  return {
+    AsyncLocalStorage: AsyncLocalStorage,
+    AsyncResource: AsyncResource,
+    executionAsyncId: function () { return 0; },
+    executionAsyncResource: function () { return {}; },
+    triggerAsyncId: function () { return 0; },
+    createHook: function () { return { enable: function () {}, unenable: function () {}, disable: function () {} }; },
+  };
+})()
+"#;
+
+const QUERYSTRING_JS: &str = r#"
+(function(){
+  function escape(s){
+    return String(s).replace(/[\x00-\x20"'#%&+,\/;<=>?@[\]^`{|}~\\]/g, function(c){
+      return '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0');
+    });
+  }
+  function unescape(s){
+    return String(s).replace(/\+/g, ' ').replace(/%([0-9A-Fa-f]{2})/g, function(_, h){
+      return String.fromCharCode(parseInt(h, 16));
+    });
+  }
+  function parse(qs, sep, eq, options){
+    qs = String(qs || '');
+    sep = sep || '&';
+    eq = eq || '=';
+    var out = {};
+    if (qs === '') return out;
+    for (var _i = 0, _a = qs.split(sep); _i < _a.length; _i++) {
+      var pair = _a[_i];
+      if (pair === '') continue;
+      var idx = pair.indexOf(eq);
+      var key, val;
+      if (idx === -1) { key = unescape(pair); val = ''; }
+      else { key = unescape(pair.slice(0, idx)); val = unescape(pair.slice(idx + eq.length)); }
+      if (Object.prototype.hasOwnProperty.call(out, key)) {
+        if (Array.isArray(out[key])) out[key].push(val);
+        else out[key] = [out[key], val];
+      } else {
+        out[key] = val;
+      }
+    }
+    return out;
+  }
+  function stringify(obj, sep, eq, options){
+    sep = sep || '&';
+    eq = eq || '=';
+    var parts = [];
+    for (var k in obj) {
+      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+      var v = obj[k];
+      if (Array.isArray(v)) {
+        for (var j = 0; j < v.length; j++) parts.push(escape(k) + eq + escape(v[j]));
+      } else {
+        parts.push(escape(k) + eq + escape(v));
+      }
+    }
+    return parts.join(sep);
+  }
+  return { parse: parse, stringify: stringify, encode: stringify, decode: parse, escape: escape, unescape: unescape };
+})()
+"#;
+
+// readline: structural shim. createInterface returns an interface object
+// with the standard surface (on/once/close/prompt/question/write/pause/
+// resume/line/rollup). Events only fire from explicit `emitLine()` calls —
+// there is no async stdin pump in the runtime yet.
+const READLINE_JS: &str = r#"
+(function(){
+  var EE = require('events').EventEmitter;
+  function Interface(input, output){
+    EE.call(this);
+    this.input = input || null;
+    this.output = output || null;
+    this.lines = [];
+    this.closed = false;
+  }
+  Object.setPrototypeOf(Interface.prototype, EE.prototype);
+  Interface.prototype.write = function(line){
+    this.lines.push(String(line));
+    this.emit('line', String(line));
+    return this;
+  };
+  Interface.prototype.prompt = function(){ return this; };
+  Interface.prototype.setPrompt = function(){ return this; };
+  Interface.prototype.question = function(_q, cb){ return this; };
+  Interface.prototype.pause = function(){ return this; };
+  Interface.prototype.resume = function(){ return this; };
+  Interface.prototype.close = function(){ if (!this.closed) { this.closed = true; this.emit('close'); } return this; };
+  Interface.prototype.createInterface = undefined;
+  function createInterface(opts){
+    if (opts && typeof opts === 'object' && opts.input && opts.input.write && opts.input.readable) {
+      // In-process piping (e.g. input from another stream object) is not
+      // wired up; return the structural interface regardless.
+    }
+    return new Interface(opts && opts.input, opts && opts.output);
+  }
+  return { createInterface: createInterface, Interface: Interface };
+})()
+"#;
+
+// perf_hooks: monotonic clock + the performance timeline surface.
+const PERF_HOOKS_JS: &str = r#"
+(function(){
+  var t0 = Date.now();
+  var marks = {};
+  var performance = {
+    now: function(){ return Date.now() - t0 + 0.25; },
+    timeOrigin: t0,
+    mark: function(name){ marks[name] = performance.now(); },
+    measure: function(name, start, end){
+      var s = marks[start] || 0;
+      var e = marks[end] || performance.now();
+      return e - s;
+    },
+    getEntries: function(){ return []; },
+    getEntriesByName: function(){ return []; },
+    getEntriesByType: function(){ return []; },
+    clearMarks: function(){ marks = {}; },
+    clearMeasures: function(){},
+    eventLoopUtilization: function(){ return { idle: 0, active: 0, utilization: 0 }; },
+    nodeTiming: {}
+  };
+  function monitorEventLoopDelay(){
+    return {
+      enable: function(){}, disable: function(){},
+      get min(){ return 1e9; }, get max(){ return 0; },
+      get mean(){ return 0; }, get stddev(){ return 0; },
+      get percentiles(){ return {}; },
+      percentile: function(){ return 0; }, reset: function(){}
+    };
+  }
+  return { performance: performance, monitorEventLoopDelay: monitorEventLoopDelay, nodeTiming: {}, constants: {} };
+})()
+"#;
 
 const EVENTS_EMITTER_JS: &str = r#"
 (function(){
@@ -4420,32 +5408,666 @@ fn assert_ok_callback(
     }
 }
 
+// ---------- assert comparison core ----------
+
+#[derive(Clone, Copy, PartialEq)]
+enum AssertCmp {
+    Equal,
+    DeepEqual,
+    StrictEqual,
+    DeepStrictEqual,
+    NotEqual,
+    NotDeepEqual,
+    NotStrictEqual,
+    NotDeepStrictEqual,
+}
+
+fn assert_compare_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _mut_rv: v8::ReturnValue,
+    cmp: AssertCmp,
+) {
+    let a = args.get(0);
+    let b = args.get(1);
+    let deep = matches!(
+        cmp,
+        AssertCmp::DeepEqual
+            | AssertCmp::DeepStrictEqual
+            | AssertCmp::NotDeepEqual
+            | AssertCmp::NotDeepStrictEqual
+    );
+    let strict = matches!(
+        cmp,
+        AssertCmp::StrictEqual
+            | AssertCmp::DeepStrictEqual
+            | AssertCmp::NotStrictEqual
+            | AssertCmp::NotDeepStrictEqual
+    );
+    let mut equal = if deep {
+        js_deep_equal(scope, a, b, strict, 0)
+    } else if strict {
+        a.same_value(b)
+    } else {
+        js_loose_equal(scope, a, b)
+    };
+    if matches!(
+        cmp,
+        AssertCmp::NotEqual | AssertCmp::NotStrictEqual | AssertCmp::NotDeepEqual | AssertCmp::NotDeepStrictEqual
+    ) {
+        equal = !equal;
+    }
+    if !equal {
+        let sa = value_repr(scope, a);
+        let sb = value_repr(scope, b);
+        let default_msg = if cmp == AssertCmp::NotEqual
+            || cmp == AssertCmp::NotStrictEqual
+            || cmp == AssertCmp::NotDeepEqual
+            || cmp == AssertCmp::NotDeepStrictEqual
+        {
+            format!("Values unexpectedly equal: {} == {}", sa, sb)
+        } else {
+            format!("{} != {}", sa, sb)
+        };
+        let msg = get_str(scope, args.get(2))
+            .map(|m| format!("{}: {} != {}", m, sa, sb))
+            .unwrap_or(default_msg);
+        throw_assertion_error(scope, &msg);
+    }
+}
+
+/// Human-readable short representation for assertion messages.
+fn value_repr(scope: &mut v8::PinScope, v: v8::Local<v8::Value>) -> String {
+    if v.is_string() {
+        return format!("'{}'", get_str(scope, v).unwrap_or_default());
+    }
+    if v.is_object() || v.is_array() {
+        if let Some(json) = v8::json::stringify(scope, v) {
+            return json.to_rust_string_lossy(scope);
+        }
+    }
+    v.to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_default()
+}
+
+/// Loose (==) equality, mirrors JS abstract equality for common cases.
+fn js_loose_equal(scope: &mut v8::PinScope, a: v8::Local<v8::Value>, b: v8::Local<v8::Value>) -> bool {
+    if a.same_value(b) {
+        return true;
+    }
+    if a.is_null_or_undefined() && b.is_null_or_undefined() {
+        return true;
+    }
+    if a.is_null_or_undefined() || b.is_null_or_undefined() {
+        return false;
+    }
+    if a.is_boolean() {
+        return js_loose_equal(scope, v8::Number::new(scope, if a.boolean_value(scope) { 1.0 } else { 0.0 }).into(), b);
+    }
+    if b.is_boolean() {
+        return js_loose_equal(scope, a, v8::Number::new(scope, if b.boolean_value(scope) { 1.0 } else { 0.0 }).into());
+    }
+    // Boxed primitives (new Number(1), new String("x")) compare via valueOf.
+    if a.is_object() && !b.is_object() {
+        if let Some(p) = unbox_primitive(scope, a) {
+            return js_loose_equal(scope, p, b);
+        }
+        return false;
+    }
+    if b.is_object() && !a.is_object() {
+        if let Some(p) = unbox_primitive(scope, b) {
+            return js_loose_equal(scope, a, p);
+        }
+        return false;
+    }
+    if a.is_number() && b.is_string() {
+        let nb = get_str(scope, b).and_then(|s| parse_js_number(&s));
+        return a.number_value(scope).zip(nb).map(|(x, y)| x == y).unwrap_or(false);
+    }
+    if a.is_string() && b.is_number() {
+        let na = get_str(scope, a).and_then(|s| parse_js_number(&s));
+        return na.zip(b.number_value(scope)).map(|(x, y)| x == y).unwrap_or(false);
+    }
+    // Fallback: string coercion on both sides (covers most remaining cases).
+    let sa = a.to_string(scope).map(|s| s.to_rust_string_lossy(scope));
+    let sb = b.to_string(scope).map(|s| s.to_rust_string_lossy(scope));
+    match (sa, sb) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn parse_js_number(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Some(0.0);
+    }
+    if let Ok(n) = t.parse::<f64>() {
+        return Some(n);
+    }
+    // hex / octal literals
+    let lower = t.to_ascii_lowercase();
+    if let Some(h) = lower.strip_prefix("0x") {
+        return i64::from_str_radix(h, 16).ok().map(|v| v as f64);
+    }
+    if let Some(o) = lower.strip_prefix("0o") {
+        return i64::from_str_radix(o, 8).ok().map(|v| v as f64);
+    }
+    match lower.as_str() {
+        "infinity" | "+infinity" => Some(f64::INFINITY),
+        "-infinity" => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
+}
+
+/// Cycle guard: pairs of objects currently being compared. An in-progress
+/// (a, b) pair re-encountered deeper in the recursion is treated as equal
+/// (standard approach — the cycle is the same shape on both sides).
+type SeenPairs = Vec<(v8::Global<v8::Value>, v8::Global<v8::Value>)>;
+
+fn pair_seen(
+    scope: &mut v8::PinScope,
+    seen: &SeenPairs,
+    a: v8::Local<v8::Value>,
+    b: v8::Local<v8::Value>,
+) -> bool {
+    seen.iter().any(|(ga, gb)| {
+        ga.open(scope).strict_equals(a) && gb.open(scope).strict_equals(b)
+    })
+}
+
+/// Structural deep equality. `strict` uses Object.is between primitives;
+/// non-strict falls back to loose equality for primitives.
+fn js_deep_equal(
+    scope: &mut v8::PinScope,
+    a: v8::Local<v8::Value>,
+    b: v8::Local<v8::Value>,
+    strict: bool,
+    depth: usize,
+) -> bool {
+    let mut seen: SeenPairs = Vec::new();
+    js_deep_equal_r(scope, a, b, strict, depth, &mut seen)
+}
+
+fn js_deep_equal_r(
+    scope: &mut v8::PinScope,
+    a: v8::Local<v8::Value>,
+    b: v8::Local<v8::Value>,
+    strict: bool,
+    depth: usize,
+    seen: &mut SeenPairs,
+) -> bool {
+    if a.same_value(b) {
+        return true;
+    }
+    if depth > 64 {
+        return false; // pathological depth; refuse rather than recurse forever
+    }
+    // Cycles: an in-progress (a, b) pair is treated as equal. We track pairs
+    // by comparing the pair-identity tables built during recursion.
+    let a_obj = a.is_object();
+    let b_obj = b.is_object();
+    if !a_obj && !b_obj {
+        if strict {
+            return false; // distinct primitives and not Object.is-equal
+        }
+        return js_loose_equal(scope, a, b);
+    }
+    if a_obj != b_obj {
+        return false;
+    }
+    if a_obj && pair_seen(scope, seen, a, b) {
+        // Re-entered a pair already being compared higher up: the cycle is
+        // the same shape on both sides.
+        return true;
+    }
+    if !a.is_object() {
+        return false;
+    }
+    if strict {
+        // deepStrictEqual also requires compatible prototypes (same constructor).
+        let pa = v8::Local::<v8::Object>::try_from(a).ok().and_then(|o| o.get_prototype(scope));
+        let pb = v8::Local::<v8::Object>::try_from(b).ok().and_then(|o| o.get_prototype(scope));
+        if let (Some(pa), Some(pb)) = (pa, pb) {
+            if !js_deep_equal_r(scope, pa.into(), pb.into(), true, depth + 1, seen) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    // Date: time value.
+    if a.is_date() || b.is_date() {
+        return a.is_date() && b.is_date() && date_time(scope, a) == date_time(scope, b);
+    }
+    // RegExp: source + flags.
+    if a.is_reg_exp() || b.is_reg_exp() {
+        if !a.is_reg_exp() || !b.is_reg_exp() {
+            return false;
+        }
+        let ra = a.to_string(scope).map(|s| s.to_rust_string_lossy(scope));
+        let rb = b.to_string(scope).map(|s| s.to_rust_string_lossy(scope));
+        // Same source+flags (text form); ignore lastIndex for deepStrictEqual? Node includes it; keep lenient.
+        return ra == rb;
+    }
+    // Array: length + elementwise.
+    if a.is_array() || b.is_array() {
+        if !a.is_array() || !b.is_array() {
+            return false;
+        }
+        // fall through to generic object compare below; arrays enumerate
+        // their indices as own properties, so key-set+value compare is exact.
+    }
+    // ArrayBuffer: byte compare.
+    if a.is_array_buffer() || b.is_array_buffer() {
+        if !a.is_array_buffer() || !b.is_array_buffer() {
+            return false;
+        }
+        return array_buffers_equal(scope, a, b);
+    }
+    // Map / Set.
+    if a.is_map() || b.is_set() || a.is_set() || b.is_map() {
+        if !same_container_kind(a, b) {
+            return false;
+        }
+        seen.push((v8::Global::new(scope, a), v8::Global::new(scope, b)));
+        let ok = if a.is_map() {
+            maps_equal(scope, a, b, strict, depth, seen)
+        } else {
+            sets_equal(scope, a, b, strict, depth, seen)
+        };
+        seen.pop();
+        return ok;
+    }
+    // Typed arrays: same kind (prototype equality covers this in strict mode)
+    // plus elementwise compare.
+    if a.is_typed_array() || b.is_typed_array() {
+        if !a.is_typed_array() || !b.is_typed_array() {
+            return false;
+        }
+        return typed_arrays_equal(scope, a, b, strict);
+    }
+
+    // Generic object: own enumerable key sets must match, values deep-equal.
+    let ao = match v8::Local::<v8::Object>::try_from(a) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let bo = match v8::Local::<v8::Object>::try_from(b) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    seen.push((v8::Global::new(scope, a), v8::Global::new(scope, b)));
+    let ok = obj_keys_deep_equal(scope, ao, bo, strict, depth, seen);
+    seen.pop();
+    ok
+}
+
+fn obj_keys_deep_equal(
+    scope: &mut v8::PinScope,
+    ao: v8::Local<v8::Object>,
+    bo: v8::Local<v8::Object>,
+    strict: bool,
+    depth: usize,
+    seen: &mut SeenPairs,
+) -> bool {
+    let names_args = || v8::GetPropertyNamesArgs {
+        mode: v8::KeyCollectionMode::OwnOnly,
+        property_filter: v8::PropertyFilter::ONLY_ENUMERABLE | v8::PropertyFilter::SKIP_SYMBOLS,
+        index_filter: v8::IndexFilter::IncludeIndices,
+        key_conversion: v8::KeyConversionMode::ConvertToString,
+    };
+    let a_keys = ao.get_own_property_names(scope, names_args());
+    let b_keys = bo.get_own_property_names(scope, names_args());
+    let (a_keys, mut b_keys) = match (a_keys, b_keys) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+    let a_len = a_keys.length();
+    let b_len = b_keys.length();
+    if a_len != b_len {
+        return false;
+    }
+    // Build key strings.
+    let mut b_set: std::collections::HashMap<String, v8::Local<v8::Value>> = std::collections::HashMap::new();
+    for i in 0..b_len {
+        let key = b_keys.get_index(scope, i);
+        if let Some(k) = key {
+            let ks = k.to_string(scope).map(|s| s.to_rust_string_lossy(scope)).unwrap_or_default();
+            let val = bo.get(scope, k);
+            if let Some(val) = val {
+                b_set.insert(ks, val);
+            }
+        }
+    }
+    for i in 0..a_len {
+        let key = a_keys.get_index(scope, i);
+        let Some(key) = key else { return false };
+        let ks = key.to_string(scope).map(|s| s.to_rust_string_lossy(scope)).unwrap_or_default();
+        let Some(bval) = b_set.get(&ks) else { return false };
+        let aval = match ao.get(scope, key) {
+            Some(v) => v,
+            None => return false,
+        };
+        if !js_deep_equal_r(scope, aval, *bval, strict, depth + 1, seen) {
+            return false;
+        }
+    }
+    true
+}
+
+fn unbox_primitive<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    v: v8::Local<v8::Value>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let obj = v8::Local::<v8::Object>::try_from(v).ok()?;
+    let value_key = v8::String::new(scope, "valueOf").unwrap();
+    let method = obj.get(scope, value_key.into())?;
+    let func = v8::Local::<v8::Function>::try_from(method).ok()?;
+    let undefined = v8::undefined(scope);
+    let result = func.call(scope, v.into(), &[]);
+    let result = result?;
+    if result.is_object() || result.is_null_or_undefined() {
+        return None;
+    }
+    Some(result)
+}
+
+fn date_time(scope: &mut v8::PinScope, v: v8::Local<v8::Value>) -> Option<f64> {
+    let obj = v8::Local::<v8::Object>::try_from(v).ok()?;
+    let key = v8::String::new(scope, "getTime").unwrap();
+    let method = obj.get(scope, key.into())?;
+    let func = v8::Local::<v8::Function>::try_from(method).ok()?;
+    let undefined = v8::undefined(scope);
+    let result = func.call(scope, v.into(), &[])?;
+    result.number_value(scope)
+}
+
+fn array_buffers_equal(_scope: &mut v8::PinScope, a: v8::Local<v8::Value>, b: v8::Local<v8::Value>) -> bool {
+    let (ab, bb) = match (
+        v8::Local::<v8::ArrayBuffer>::try_from(a),
+        v8::Local::<v8::ArrayBuffer>::try_from(b),
+    ) {
+        (Ok(x), Ok(y)) => (x, y),
+        _ => return false,
+    };
+    if ab.byte_length() != bb.byte_length() {
+        return false;
+    }
+    if ab.byte_length() == 0 {
+        return true;
+    }
+    let (Some(adat), Some(bdat)) = (ab.data(), bb.data()) else {
+        return false;
+    };
+    unsafe {
+        std::slice::from_raw_parts(adat.as_ptr() as *const u8, ab.byte_length())
+            == std::slice::from_raw_parts(bdat.as_ptr() as *const u8, bb.byte_length())
+    }
+}
+
+// Prototype inequality (strict mode) covers typed array kinds, but also
+// record the constructor name for diagnostics.
+fn typed_array_kind(scope: &mut v8::PinScope, v: v8::Local<v8::Value>) -> String {
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(v) else {
+        return String::new();
+    };
+    let name = obj.get_constructor_name();
+    name.to_rust_string_lossy(scope)
+}
+
+fn typed_arrays_equal(
+    scope: &mut v8::PinScope,
+    a: v8::Local<v8::Value>,
+    b: v8::Local<v8::Value>,
+    strict: bool,
+) -> bool {
+    if !strict && typed_array_kind(scope, a) != typed_array_kind(scope, b) {
+        return false;
+    }
+    let (oa, ob) = match (
+        v8::Local::<v8::Object>::try_from(a),
+        v8::Local::<v8::Object>::try_from(b),
+    ) {
+        (Ok(x), Ok(y)) => (x, y),
+        _ => return false,
+    };
+    let (ta, tb) = match (
+        v8::Local::<v8::TypedArray>::try_from(a),
+        v8::Local::<v8::TypedArray>::try_from(b),
+    ) {
+        (Ok(x), Ok(y)) => (x, y),
+        _ => return false,
+    };
+    if ta.length() != tb.length() {
+        return false;
+    }
+    for i in 0..ta.length() {
+        let (av, bv) = match (oa.get_index(scope, i as u32), ob.get_index(scope, i as u32)) {
+            (Some(x), Some(y)) => (x, y),
+            _ => return false,
+        };
+        if !av.same_value(bv) {
+            return false;
+        }
+    }
+    true
+}
+
+fn container_size(scope: &mut v8::PinScope, v: v8::Local<v8::Value>, size_key: &str) -> Option<u32> {
+    let obj = v8::Local::<v8::Object>::try_from(v).ok()?;
+    let key = v8::String::new(scope, size_key).unwrap();
+    let val = obj.get(scope, key.into())?;
+    let n = val.number_value(scope)?;
+    if n < 0.0 || n > u32::MAX as f64 {
+        return None;
+    }
+    Some(n as u32)
+}
+
+fn same_container_kind(a: v8::Local<v8::Value>, b: v8::Local<v8::Value>) -> bool {
+    (a.is_map() && b.is_map()) || (a.is_set() && b.is_set())
+}
+
+fn maps_equal(scope: &mut v8::PinScope, a: v8::Local<v8::Value>, b: v8::Local<v8::Value>, strict: bool, depth: usize, seen: &mut SeenPairs) -> bool {
+    let sa = container_size(scope, a, "size");
+    let sb = container_size(scope, b, "size");
+    let (sa, sb) = match (sa, sb) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return false,
+    };
+    if sa != sb {
+        return false;
+    }
+    if sa == 0 {
+        return true;
+    }
+    let Some(ea) = call_container_method(scope, a, "entries") else {
+        return false;
+    };
+    let Some(eb) = call_container_method(scope, b, "entries") else {
+        return false;
+    };
+    let mut a_pairs: Vec<(v8::Local<v8::Value>, v8::Local<v8::Value>)> = Vec::with_capacity(sa as usize);
+    let mut b_keys: Vec<(v8::Local<v8::Value>, v8::Local<v8::Value>)> = Vec::with_capacity(sb as usize);
+    for (it, out) in [(ea, &mut a_pairs), (eb, &mut b_keys)] {
+        let next_key = v8::String::new(scope, "next").unwrap();
+        loop {
+            let obj = match v8::Local::<v8::Object>::try_from(it) {
+                Ok(o) => o,
+                Err(_) => return false,
+            };
+            let Some(next) = obj.get(scope, next_key.into()) else { return false };
+            let Ok(next_fn) = v8::Local::<v8::Function>::try_from(next) else {
+                return false;
+            };
+            let Some(step) = next_fn.call(scope, it.into(), &[]) else {
+                return false;
+            };
+            let Ok(so) = v8::Local::<v8::Object>::try_from(step) else {
+                return false;
+            };
+            let done_key = v8::String::new(scope, "done").unwrap();
+            let Some(done) = so.get(scope, done_key.into()) else { return false };
+            if done.boolean_value(scope) {
+                break;
+            }
+            let value_key = v8::String::new(scope, "value").unwrap();
+            let Some(pair) = so.get(scope, value_key.into()) else { return false };
+            let Ok(po) = v8::Local::<v8::Array>::try_from(pair) else {
+                return false;
+            };
+            match (po.get_index(scope, 0), po.get_index(scope, 1)) {
+                (Some(k), Some(v)) => out.push((k, v)),
+                _ => return false,
+            }
+        }
+    }
+    for (ak, av) in &a_pairs {
+        let found = b_keys.iter().any(|(bk, bv)| {
+            js_deep_equal_r(scope, *ak, *bk, strict, depth + 1, seen)
+                && js_deep_equal_r(scope, *av, *bv, strict, depth + 1, seen)
+        });
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+fn sets_equal(scope: &mut v8::PinScope, a: v8::Local<v8::Value>, b: v8::Local<v8::Value>, strict: bool, depth: usize, seen: &mut SeenPairs) -> bool {
+    let sa = container_size(scope, a, "size");
+    let sb = container_size(scope, b, "size");
+    let (sa, sb) = match (sa, sb) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return false,
+    };
+    if sa != sb {
+        return false;
+    }
+    if sa == 0 {
+        return true;
+    }
+    let Some(ea) = call_container_method(scope, a, "values") else {
+        return false;
+    };
+    let Some(eb) = call_container_method(scope, b, "values") else {
+        return false;
+    };
+    fn collect<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        it: v8::Local<'s, v8::Value>,
+        cap: u32,
+    ) -> Option<Vec<v8::Local<'s, v8::Value>>> {
+        let mut out = Vec::with_capacity(cap as usize);
+        let next_key = v8::String::new(scope, "next").unwrap();
+        loop {
+            let obj = v8::Local::<v8::Object>::try_from(it).ok()?;
+            let next = obj.get(scope, next_key.into())?;
+            let next_fn = v8::Local::<v8::Function>::try_from(next).ok()?;
+            let step = next_fn.call(scope, it.into(), &[])?;
+            let so = v8::Local::<v8::Object>::try_from(step).ok()?;
+            let done_key = v8::String::new(scope, "done").unwrap();
+            let done = so.get(scope, done_key.into())?;
+            if done.boolean_value(scope) {
+                break;
+            }
+            let value_key = v8::String::new(scope, "value").unwrap();
+            let val = so.get(scope, value_key.into())?;
+            out.push(val);
+        }
+        Some(out)
+    }
+    let (a_items, b_items) = match (collect(scope, ea, sa), collect(scope, eb, sb)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return false,
+    };
+    for av in &a_items {
+        let found = b_items.iter().any(|bv| js_deep_equal_r(scope, *av, *bv, strict, depth + 1, seen));
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+fn call_container_method<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    v: v8::Local<v8::Value>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let obj = v8::Local::<v8::Object>::try_from(v).ok()?;
+    let key = v8::String::new(scope, name).unwrap();
+    let method = obj.get(scope, key.into())?;
+    let func = v8::Local::<v8::Function>::try_from(method).ok()?;
+    let undefined = v8::undefined(scope);
+    func.call(scope, v.into(), &[])
+}
+
 fn assert_equal_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
-    let a = args
-        .get(0)
-        .to_string(scope)
-        .map(|s| s.to_rust_string_lossy(scope))
-        .unwrap_or_default();
-    let b = args
-        .get(1)
-        .to_string(scope)
-        .map(|s| s.to_rust_string_lossy(scope))
-        .unwrap_or_default();
-    let num_match = match (args.get(0).number_value(scope), args.get(1).number_value(scope)) {
-        (Some(x), Some(y)) => Some(x == y),
-        _ => None,
-    };
-    let equal = num_match.unwrap_or(a == b);
-    if !equal {
-        let msg = get_str(scope, args.get(2))
-            .map(|m| format!("{}: {} != {}", m, a, b))
-            .unwrap_or_else(|| format!("{} != {}", a, b));
-        throw_assertion_error(scope, &msg);
-    }
+    assert_compare_callback(scope, args, _mut_rv, AssertCmp::Equal);
+}
+
+fn assert_deep_equal_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _mut_rv: v8::ReturnValue,
+) {
+    assert_compare_callback(scope, args, _mut_rv, AssertCmp::DeepEqual);
+}
+
+fn assert_deep_strict_equal_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _mut_rv: v8::ReturnValue,
+) {
+    assert_compare_callback(scope, args, _mut_rv, AssertCmp::DeepStrictEqual);
+}
+
+fn assert_strict_equal_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _mut_rv: v8::ReturnValue,
+) {
+    assert_compare_callback(scope, args, _mut_rv, AssertCmp::StrictEqual);
+}
+
+fn assert_not_equal_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _mut_rv: v8::ReturnValue,
+) {
+    assert_compare_callback(scope, args, _mut_rv, AssertCmp::NotEqual);
+}
+
+fn assert_not_deep_equal_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _mut_rv: v8::ReturnValue,
+) {
+    assert_compare_callback(scope, args, _mut_rv, AssertCmp::NotDeepEqual);
+}
+
+fn assert_not_strict_equal_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _mut_rv: v8::ReturnValue,
+) {
+    assert_compare_callback(scope, args, _mut_rv, AssertCmp::NotStrictEqual);
+}
+
+fn assert_not_deep_strict_equal_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _mut_rv: v8::ReturnValue,
+) {
+    assert_compare_callback(scope, args, _mut_rv, AssertCmp::NotDeepStrictEqual);
 }
 
 fn assert_if_error_callback(
@@ -4474,22 +6096,122 @@ fn assert_throws_callback(
     args: v8::FunctionCallbackArguments,
     _mut_rv: v8::ReturnValue,
 ) {
-    if args.length() > 0 {
-        let f = args.get(0);
-        if let Ok(func) = v8::Local::<v8::Function>::try_from(f) {
-            let undefined = v8::undefined(scope);
-            let caught = {
-                v8::tc_scope!(let tc, scope);
-                let _result = func.call(tc, undefined.into(), &[]);
-                tc.has_caught()
-            };
-            if !caught {
-                let msg = get_str(scope, args.get(1))
-                    .unwrap_or_else(|| "Function expected to throw".to_string());
-                throw_assertion_error(scope, &msg);
-            }
+    if args.length() == 0 {
+        return;
+    }
+    let f = args.get(0);
+    let Ok(func) = v8::Local::<v8::Function>::try_from(f) else {
+        return;
+    };
+    let undefined = v8::undefined(scope);
+    let caught = {
+        v8::tc_scope!(let tc, scope);
+        let _result = func.call(tc, undefined.into(), &[]);
+        if tc.has_caught() {
+            Some(tc.exception().unwrap())
+        } else {
+            None
+        }
+    };
+    let Some(err) = caught else {
+        let msg = get_str(scope, args.get(1))
+            .unwrap_or_else(|| "Function expected to throw".to_string());
+        throw_assertion_error(scope, &msg);
+        return;
+    };
+    // Validate against the expected-error argument(s) (arg 1, and arg 2 as a
+    // second constraint like the error class in Node's `assert.throws`).
+    for constraint_idx in [1usize, 2usize] {
+        if constraint_idx >= args.length() as usize {
+            continue;
+        }
+        let constraint = args.get(constraint_idx as i32);
+        if constraint.is_undefined() || constraint.is_null() {
+            continue;
+        }
+        if !assert_throws_matches(scope, err, constraint) {
+            let got = value_repr(scope, err);
+            let want = value_repr(scope, constraint);
+            let msg = get_str(scope, args.get(constraint_idx as i32 + 1))
+                .unwrap_or_else(|| format!("Expected error {} to match {}", got, want));
+            throw_assertion_error(scope, &msg);
+            return;
         }
     }
+}
+
+/// Does the thrown value match the given constraint (RegExp on message,
+/// string substring on message, constructor/class via instanceof, or an
+/// object of expected properties like { name, message }).
+fn assert_throws_matches(
+    scope: &mut v8::PinScope,
+    err: v8::Local<v8::Value>,
+    constraint: v8::Local<v8::Value>,
+) -> bool {
+    // RegExp → test against the error's message.
+    if constraint.is_reg_exp() {
+        if let Some(msg) = get_error_prop(scope, err, "message") {
+            if let (Ok(r), Some(m)) = (
+                v8::Local::<v8::RegExp>::try_from(constraint),
+                v8::String::new(scope, &msg),
+            ) {
+                return r.exec(scope, m).is_some();
+            }
+        }
+        return false;
+    }
+    // String → substring of message.
+    if constraint.is_string() {
+        let want = get_str(scope, constraint).unwrap_or_default();
+        return get_error_prop(scope, err, "message")
+            .map(|m| m.contains(&want))
+            .unwrap_or(false);
+    }
+    // Function/Class → instanceof.
+    if v8::Local::<v8::Function>::try_from(constraint).is_ok() {
+        let ctor_obj = match v8::Local::<v8::Object>::try_from(constraint) {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        return err.instance_of(scope, ctor_obj).unwrap_or(false);
+    }
+    // Object with expected properties (name, message, code, ...).
+    if let Ok(cobj) = v8::Local::<v8::Object>::try_from(constraint) {
+        let names = cobj.get_own_property_names(
+            scope,
+            v8::GetPropertyNamesArgs {
+                mode: v8::KeyCollectionMode::OwnOnly,
+                property_filter: v8::PropertyFilter::ONLY_ENUMERABLE | v8::PropertyFilter::SKIP_SYMBOLS,
+                index_filter: v8::IndexFilter::IncludeIndices,
+                key_conversion: v8::KeyConversionMode::ConvertToString,
+            },
+        );
+        let Some(names) = names else { return false };
+        let eobj = match v8::Local::<v8::Object>::try_from(err) {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        for i in 0..names.length() {
+            let Some(key) = names.get_index(scope, i) else { return false };
+            let Some(expected) = cobj.get(scope, key) else { return false };
+            let Some(actual) = eobj.get(scope, key) else { return false };
+            if !js_deep_equal(scope, actual, expected, true, 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn get_error_prop(scope: &mut v8::PinScope, err: v8::Local<v8::Value>, prop: &str) -> Option<String> {
+    let obj = v8::Local::<v8::Object>::try_from(err).ok()?;
+    let key = v8::String::new(scope, prop).unwrap();
+    let val = obj.get(scope, key.into())?;
+    if val.is_undefined() {
+        return None;
+    }
+    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
 }
 
 fn call_first_arg_callback(

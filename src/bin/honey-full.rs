@@ -787,6 +787,22 @@ fn main() {
         return;
     }
 
+    // Debug: print the ESM->CJS transform of a file (no engine involved).
+    if argv.get(1).map(|s| s.as_str()) == Some("--internal-transform-js") {
+        let Some(f) = argv.get(2) else {
+            eprintln!("usage: honey --internal-transform-js <file>");
+            std::process::exit(2);
+        };
+        match std::fs::read_to_string(f) {
+            Ok(src) => print!("{}", honey::runtime::transform_esm_to_cjs_debug(&src)),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // Dev-loop fast path: dispatch `honey run <file>` directly, skipping
     // clap parsing. Every ~0.5 ms counts at this timescale.
     if argv.get(1).map(|s| s.as_str()) == Some("run") && argv.len() >= 3 {
@@ -978,11 +994,13 @@ fn main() {
             std::process::exit(code);
         }
         Commands::Migrate { file } => {
-            println!("honey migrate");
-            if let Some(f) = file {
-                println!("  file: {}", f);
+            match honey::migrate::migrate(file.as_deref()) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("error: {:#}", e);
+                    std::process::exit(1);
+                }
             }
-            // TODO: implement migrate
         }
         Commands::Start => {
             match daemon::start_daemon() {
