@@ -3,5 +3,4 @@ target/
 node_modules
 .DS_Store
 *.tar.xz
-jgl_build/
 hbun.lock
