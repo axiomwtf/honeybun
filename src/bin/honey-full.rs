@@ -511,13 +511,13 @@ fn run_test_suite(filter: Option<&str>, slow: bool, watch: bool) -> i32 {
         println!("SKIP {} (slow; pass --slow to include)", display(p));
     }
 
-    // (absolute file path, JS preload wrapper) for each test file.
+    // (absolute file path, JS preload wrapper) for each test file. Wrappers
+    // are built LAZILY by the consumers: the daemon path never needs them
+    // (the daemon reads the files anyway — see serve_test_batch), so paying
+    // a read + ESM sniff per file here would tax the daemon path for nothing.
     let jobs: Vec<(String, String)> = to_run
         .iter()
-        .map(|p| {
-            let abs = p.to_string_lossy().into_owned();
-            (abs.clone(), test_preload_for(p).unwrap_or_default())
-        })
+        .map(|p| (p.to_string_lossy().into_owned(), String::new()))
         .collect();
 
     if watch {
@@ -534,9 +534,20 @@ fn run_test_suite(filter: Option<&str>, slow: bool, watch: bool) -> i32 {
     i32::from(failed > 0)
 }
 
-/// Run a test batch: one tokio task per file, concurrency capped at num_cpus
-/// (semaphore), buffered results printed in original path order.
+// Run a test batch: one tokio task per file, concurrency capped at num_cpus
+// (semaphore), buffered results printed in original path order.
+// `jobs` carries (path, preload-wrapper); an empty wrapper here means "build
+// it lazily at use site" — the daemon path never wants wrappers, and the
+// local fallbacks only need each one when its file actually runs.
 fn run_test_batch(jobs: &[(String, String)]) -> (usize, usize) {
+    // Resolve a possibly-lazy wrapper once the file is about to run.
+    let preload_of = |p: &str, wrapped: &str| -> String {
+        if wrapped.is_empty() {
+            test_preload_for(std::path::Path::new(p)).unwrap_or_default()
+        } else {
+            wrapped.to_string()
+        }
+    };
     let sequential = std::env::var("HONEY_TEST_SEQUENTIAL").as_deref() == Ok("1");
     let update = snapshot_update_enabled();
     let cap = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -594,7 +605,7 @@ fn run_test_batch(jobs: &[(String, String)]) -> (usize, usize) {
                 for (file, preload) in jobs {
                     let r = tokio::task::spawn_blocking({
                         let file = file.clone();
-                        let preload = preload.clone();
+                        let preload = preload_of(&file, &preload);
                         move || run_single_test(&file, &preload)
                     })
                     .await
@@ -609,7 +620,7 @@ fn run_test_batch(jobs: &[(String, String)]) -> (usize, usize) {
             for (file, preload) in jobs {
                 let sem = sem.clone();
                 let file = file.clone();
-                let preload = preload.clone();
+                let preload = preload_of(&file, &preload);
                 handles.push(tokio::task::spawn(async move {
                     let _permit = sem.acquire().await;
                     tokio::task::spawn_blocking(move || run_single_test(&file, &preload))
@@ -641,7 +652,8 @@ fn run_test_batch(jobs: &[(String, String)]) -> (usize, usize) {
             let mut passed = 0usize;
             let mut failed = 0usize;
             for (file, preload) in jobs {
-                let resp = run_single_test(file, preload);
+                let preload = preload_of(file, &preload);
+                let resp = run_single_test(file, &preload);
                 let rel = rel_display(file, &std::env::current_dir().unwrap_or_default());
                 let (p, f) = print_file_result(&rel, &resp, file, update);
                 passed += p;
@@ -656,8 +668,20 @@ fn run_test_batch(jobs: &[(String, String)]) -> (usize, usize) {
 /// subprocess re-runs for affected files); stat-poll fallback when the daemon
 /// is unavailable. Loops until interrupted.
 fn run_test_watch(jobs: &[(String, String)], cwd: &std::path::Path) {
+    // Watch sessions run the batch on worker subprocesses, which consume real
+    // wrapper sources (first batch); daemon-side watch only re-runs affected
+    // files after edits. Resolve lazy wrappers here, once, per file.
     let abs_files: Vec<String> = jobs.iter().map(|(f, _)| f.clone()).collect();
-    let preloads: Vec<String> = jobs.iter().map(|(_, p)| p.clone()).collect();
+    let preloads: Vec<String> = jobs
+        .iter()
+        .map(|(f, p)| {
+            if p.is_empty() {
+                test_preload_for(std::path::Path::new(f)).unwrap_or_default()
+            } else {
+                p.clone()
+            }
+        })
+        .collect();
     let update = snapshot_update_enabled();
 
     if let Some(session) = daemon::test_watch_request(&abs_files, &preloads) {
