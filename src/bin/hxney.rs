@@ -118,6 +118,27 @@ fn main() {
         return;
     }
 
+    // Package-management and daemon subcommands are `honey` commands, not
+    // npx-style package executions: `hxney add ms` must install ms, not exec
+    // a package called "add". Forward the whole argv to the honey binary.
+    {
+        const MGMT: &[&str] =
+            &["add", "remove", "install", "migrate", "start", "stop", "service"];
+        if MGMT.contains(&argv[1].as_str()) {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let honey = exe.with_file_name("honey");
+            use std::os::unix::process::CommandExt as _;
+            let err = std::process::Command::new(&honey)
+                .args(std::env::args_os().skip(1))
+                .exec();
+            eprintln!(
+                "error: hxney could not exec {} ({err}); is honey installed next to it?",
+                honey.display()
+            );
+            std::process::exit(127);
+        }
+    }
+
     // Dev/trace modes and odd invocations keep the full-fat semantics.
     if std::env::var_os("HONEY_TRACE").is_some() || std::env::var_os("HONEY_NO_DAEMON").is_some()
         || argv.len() < 2
