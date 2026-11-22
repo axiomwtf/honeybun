@@ -18,7 +18,10 @@
 //!   EXTERNAL: the emitted file keeps the literal specifier for the runtime
 //!   to resolve. CSS imports are extracted to a sibling `.css` output.
 //! - honey.config.ts is ignored (config hooks are wired later).
-//! - No tree-shaking, no minification (later Cinnamon layers).
+//! - Tree-shaking v2: cross-module used-export analysis prunes unused export
+//!   wiring and drops side-effect-free modules that fell out of the graph
+//!   (conservative: unknown shapes always classify as used). Minification
+//!   came with the oxc codegen layer.
 //! - Cycles are allowed and behave like CommonJS circular requires: a module
 //!   mid-evaluation exposes its (partial) exports object.
 
@@ -684,6 +687,11 @@ struct Module {
     dir: String,
     code: String,
     strict: bool,
+    /// True when this module came through the ESM processor: its export
+    /// surface is fully described by generator-shaped `exports["k"] = ...;`
+    /// epilogue lines (peak of the tree-shaking analysis). CJS modules keep
+    /// arbitrary export-assignment code and are always treated as All.
+    esm: bool,
     /// Line offset of this module's code within the bundle (filled at
     /// emission; used for sourcemap token shifting).
     bundle_line_offset: usize,
@@ -880,7 +888,7 @@ fn process_module(id: &Path, temp: &mut usize, opts: &BuildOptions) -> Result<(M
     if id.extension().map(|e| e == "json").unwrap_or(false) {
         let dir = module_dir(id);
         return Ok((
-            Module { dir, code: format!("module.exports = {text};"), strict: false, bundle_line_offset: 0, source_map: None },
+            Module { dir, code: format!("module.exports = {text};"), strict: false, esm: false, bundle_line_offset: 0, source_map: None },
             Vec::new(),
         ));
     }
@@ -1931,7 +1939,7 @@ fn process_esm(text: &str, path: &Path, temp: &mut usize) -> Result<(Module, Vec
     }
     code.push_str("exports.__esModule = true;\n");
 
-    Ok((Module { dir: module_dir(path), code, strict: true, bundle_line_offset: 0, source_map: None }, deps))
+    Ok((Module { dir: module_dir(path), code, strict: true, esm: true, bundle_line_offset: 0, source_map: None }, deps))
 }
 
 // ---------------------------------------------------------------------------
@@ -1997,7 +2005,7 @@ fn process_cjs(text: &str, path: &Path, _temp: &mut usize) -> Result<(Module, Ve
     }
 
     let code = apply_edits(text, edits);
-    Ok((Module { dir: module_dir(path), code, strict: false, bundle_line_offset: 0, source_map: None }, deps))
+    Ok((Module { dir: module_dir(path), code, strict: false, esm: false, bundle_line_offset: 0, source_map: None }, deps))
 }
 
 // ---------------------------------------------------------------------------
@@ -2448,6 +2456,757 @@ fn minify_css(css: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Tree-shaking v2: used-export analysis (cross module)
+// ---------------------------------------------------------------------------
+//
+// Model: every transformed module contributes
+//   - `real` uses: how its own body consumes each dep's export surface
+//     (named destructures, default reads, namespace/dynamic/unknown = All,
+//     side-effect-only requires),
+//   - `rewires`: export-from lines `exports["k"] = __honey_rN["remote"]`
+//     (pass-through exports; the target export is used only when k is used).
+//
+// A fixpoint from the entry seeds "all exports of the entry are used" and
+// walks real uses + rewire edges transitively (CJS deps and any unknown
+// shape upgrade to All, i.e. nothing prunes). Pruning then removes:
+//   - unused `exports["k"] = ...;` wiring lines, and
+//   - dead export-from require temps — degrading to a bare require line
+//     for deps with top-level effects, deleting outright for pure deps.
+// Finally emission keeps only factories reachable in the PRUNED graph.
+
+/// How one require site consumes a dep's export surface.
+#[derive(Clone, Debug)]
+enum ExportUsage {
+    /// The whole surface is potentially consumed (namespace import, dynamic
+    /// import, star machinery, unknown access shape). Never prunes anything.
+    All,
+    /// A default-only read (`import x from 'd'`).
+    Default,
+    /// Named reads: the dep's export names accessed at this site.
+    Named(Vec<String>),
+    /// The dep is evaluated, no exports read (`__honey_require("[d]");` and
+    /// temp declarations whose bindings never survive).
+    SideEffect,
+}
+
+/// Merged consumption state for one module's export surface.
+#[derive(Clone, Default, Debug)]
+struct UsedExports {
+    /// Any incoming `All` (or upgrade to it): nothing may be pruned.
+    all: bool,
+    /// Names provably read by at least one reached consumer.
+    names: Vec<String>,
+}
+
+impl UsedExports {
+    fn absorb(&mut self, u: &ExportUsage) -> bool {
+        match u {
+            ExportUsage::All => {
+                if self.all {
+                    false
+                } else {
+                    self.all = true;
+                    true
+                }
+            }
+            ExportUsage::Default => self.absorb_name("default"),
+            ExportUsage::Named(v) => {
+                let mut changed = false;
+                for n in v {
+                    changed |= self.absorb_name(n);
+                }
+                changed
+            }
+            ExportUsage::SideEffect => false,
+        }
+    }
+    fn absorb_name(&mut self, n: &str) -> bool {
+        if self.all || self.names.iter().any(|x| x == n) {
+            return false;
+        }
+        self.names.push(n.to_string());
+        true
+    }
+}
+
+/// A classified `__honey_require("[id]")` site in a transformed module.
+struct DepUse {
+    dep: String,
+    usage: ExportUsage,
+}
+
+/// `exports["k"] = __honey_rN["remote"];` — a pass-through export.
+struct Rewire {
+    k: String,
+    dep: String,
+    remote: String,
+}
+
+/// Everything the pruning pass needs to know about one transformed module.
+struct ModuleUse {
+    real: Vec<DepUse>,
+    rewires: Vec<Rewire>,
+}
+
+/// Parse a serde-json-style string literal starting at byte `start` (which
+/// must be a `"`). Returns the decoded string and the index just past the
+/// closing quote.
+fn read_json_str(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some((out, i + 1)),
+            b'\\' => {
+                i += 1;
+                let c = *bytes.get(i)?;
+                match c {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'n' => out.push('\n'),
+                    b't' => out.push('\t'),
+                    b'r' => out.push('\r'),
+                    b'b' => out.push('\u{8}'),
+                    b'f' => out.push('\u{c}'),
+                    b'u' => {
+                        let hex = std::str::from_utf8(bytes.get(i + 1..i + 5)?).ok()?;
+                        let n = u32::from_str_radix(hex, 16).ok()?;
+                        out.push(char::from_u32(n)?);
+                        i += 4;
+                    }
+                    _ => return None,
+                }
+                i += 1;
+            }
+            _ => {
+                let chunk = bytes[i..]
+                    .iter()
+                    .position(|&b| b == b'"' || b == b'\\')
+                    .unwrap_or(bytes.len() - i);
+                out.push_str(std::str::from_utf8(&bytes[i..i + chunk]).ok()?);
+                i += chunk;
+            }
+        }
+    }
+    None
+}
+
+/// Substring search on bytes from `from`.
+fn find_sub(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || from + needle.len() > hay.len() {
+        return None;
+    }
+    (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// Is `bs[i..]` a full identifier token occurrence (no ident chars touching)?
+fn is_token(bs: &[u8], i: usize, name: &str) -> bool {
+    let nb = name.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    if i > 0 && ident(bs[i - 1]) {
+        return false;
+    }
+    if i + nb.len() > bs.len() || &bs[i..i + nb.len()] != nb {
+        return false;
+    }
+    !(i + nb.len() < bs.len() && ident(bs[i + nb.len()]))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TempKind {
+    /// `__honey_m<n>`: import destructure temp.
+    M,
+    /// `__honey_r<n>`: export-from re-export temp.
+    R,
+    /// `__honey_a<n>`: export-star / `export * as ns` temp.
+    A,
+}
+
+fn temp_kind(name: &str) -> Option<TempKind> {
+    let (rest, kind) = if let Some(r) = name.strip_prefix("__honey_m") {
+        (r, TempKind::M)
+    } else if let Some(r) = name.strip_prefix("__honey_r") {
+        (r, TempKind::R)
+    } else if let Some(r) = name.strip_prefix("__honey_a") {
+        (r, TempKind::A)
+    } else {
+        return None;
+    };
+    if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+        Some(kind)
+    } else {
+        None
+    }
+}
+
+/// Split `content` on top-level commas, respecting double-quoted strings.
+fn split_top_level(content: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in content.chars() {
+        if in_str {
+            cur.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                cur.push(c);
+            }
+            ',' => {
+                parts.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        parts.push(cur.trim().to_string());
+    }
+    parts
+}
+
+/// Unquote a binding entry's remote side (`name`, `default`, or `"x-y"`).
+fn unquote_binding(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.starts_with('"') {
+        read_json_str(s.as_bytes(), 0).map(|(v, _)| v)
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// `var name = <rhs>;` → (name, rhs without the trailing `;`).
+fn split_var_eq(rest: &str) -> Option<(&str, &str)> {
+    let eq = rest.find('=')?;
+    let name = rest[..eq].trim();
+    let rhs = rest[eq + 1..].trim().trim_end_matches(';').trim();
+    Some((name, rhs))
+}
+
+/// `__honey_require("[d]")` inside a var rhs → Some(d).
+fn rhs_requires(rhs: &str) -> Option<String> {
+    const NEEDLE: &str = "__honey_require(";
+    let p = rhs.find(NEEDLE)?;
+    let (id, _c) = read_json_str(rhs.as_bytes(), p + NEEDLE.len())?;
+    Some(id)
+}
+
+/// From text after `exports[`, parse `"<k>"] = <rhs>;` — returns
+/// (export name, rhs text) only for exact generator shapes (rhs = plain
+/// identifier, or `__honey_rN["remote"]`).
+fn parse_export_line(rest: &str) -> Option<(String, String)> {
+    let bytes = rest.as_bytes();
+    let (k, close) = read_json_str(bytes, 0)?;
+    let after = rest.get(close..)?;
+    let after = after.strip_prefix(']')?.trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    let rhs = after.strip_suffix(';')?.trim_end();
+    if rhs.starts_with("__honey_r") {
+        // exact `__honey_rN["remote"]` shape
+        let inner = rhs.split_once('[')?.1;
+        let (_remote, rclose) = read_json_str(inner.as_bytes(), 0)?;
+        if inner.as_bytes().get(rclose) == Some(&b']') && inner.get(rclose + 1..)?.trim().is_empty()
+        {
+            let remote = read_json_str(inner.as_bytes(), 0)?.0;
+            return Some((k, format!("__honey_r[{remote}]"))); // normalized marker
+        }
+        return None;
+    }
+    if !rhs.is_empty()
+        && rhs
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+    {
+        return Some((k, rhs.to_string()));
+    }
+    None
+}
+
+/// Extract real uses + rewires from a transformed module. Only
+/// generator-shaped lines are precisely classified; any other
+/// `__honey_require("[id]")` occurrence classifies as All (conservative:
+/// never prunes by accident).
+fn extract_module_use(code: &str) -> ModuleUse {
+    const NEEDLE: &str = "__honey_require(";
+    let lines: Vec<&str> = code.split('\n').collect();
+
+    // temp name -> (kind, dep, decl line index)
+    let mut temps: HashMap<String, (TempKind, String, usize)> = HashMap::new();
+    let mut real: Vec<DepUse> = Vec::new();
+    let mut rewires: Vec<Rewire> = Vec::new();
+
+    for (li, line) in lines.iter().enumerate() {
+        let bytes = line.as_bytes();
+        let t = line.trim();
+
+        // Temp declaration lines (each also keeps the dep evaluated).
+        if let Some(rest) = t.strip_prefix("var ") {
+            if let Some((name, rhs)) = split_var_eq(rest) {
+                if let Some(kind) = temp_kind(name) {
+                    if let Some(dep) = rhs_requires(rhs) {
+                        let usage = match kind {
+                            TempKind::A => ExportUsage::All, // star copies the full surface
+                            TempKind::M | TempKind::R => ExportUsage::SideEffect,
+                        };
+                        real.push(DepUse { dep: dep.clone(), usage });
+                        temps.insert(name.to_string(), (kind, dep, li));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Export wiring lines.
+        if let Some(rest) = t.strip_prefix("exports[") {
+            if let Some((k, rhs)) = parse_export_line(rest) {
+                if let Some(inner) = rhs.strip_prefix("__honey_r[") {
+                    // normalized `__honey_r[remote]` marker from parse_export_line
+                    let remote = &inner[..inner.len() - 1];
+                    // which re-export temp produced it? Scan this line for the
+                    // actual temp name `__honey_rN`.
+                    let mut resolved = None;
+                    if let Some(bp) = line.find("__honey_r") {
+                        let tail = &line[bp..];
+                        if let Some(end) = tail.find('[') {
+                            let name = &tail[..end];
+                            if temp_kind(name) == Some(TempKind::R) {
+                                resolved = temps.get(name).map(|(_, d, _)| d.clone());
+                            }
+                        }
+                    }
+                    match resolved {
+                        Some(dep) => {
+                            rewires.push(Rewire {
+                                k,
+                                dep,
+                                remote: remote.to_string(),
+                            });
+                            continue;
+                        }
+                        None => {
+                            // unknown temp origin: conservative — treat the
+                            // dep full-surface requirement via its require
+                            // site below (the decl line already pushed it).
+                            continue;
+                        }
+                    }
+                }
+                // plain identifier rhs (or unknown-to-mark wiring): no edge
+                continue;
+            }
+            // unparsed exports[...] line: fall through to the require scan
+        }
+
+        // Require occurrences on this line.
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            let Some(p) = find_sub(bytes, idx, NEEDLE.as_bytes()) else {
+                break;
+            };
+            idx = p + NEEDLE.len();
+            let Some((dep, close)) = read_json_str(bytes, idx) else {
+                continue;
+            };
+            let before = line[..p].trim();
+            if before.is_empty() {
+                let after_txt = if idx + close < bytes.len() { &line[idx + close..] } else { "" };
+                if after_txt.trim() == ";" {
+                    real.push(DepUse { dep, usage: ExportUsage::SideEffect });
+                    continue;
+                }
+            }
+            real.push(DepUse { dep, usage: ExportUsage::All });
+        }
+    }
+
+    // M-temp consumer lines → real consumption of the dep's exports.
+    for (name, (kind, dep, decl_line)) in &temps {
+        if *kind != TempKind::M {
+            continue;
+        }
+        let mut state = UsedExports::default();
+        let mut all = false;
+        for (li2, line2) in lines.iter().enumerate() {
+            if li2 == *decl_line {
+                continue;
+            }
+            if !line2.contains(name.as_str()) {
+                continue;
+            }
+            let t2 = line2.trim();
+            let tail = format!("= {name};");
+            if t2.starts_with("var {") && t2.ends_with(&tail) {
+                // `var { a, b: c, "s-t": d, default: e } = __honey_m0;`
+                if let (Some(open), Some(close)) = (t2.find('{'), t2.rfind('}')) {
+                    for entry in split_top_level(&t2[open + 1..close]) {
+                        let remote = match entry.split_once(':') {
+                            Some((remote, _)) => unquote_binding(remote).unwrap_or_default(),
+                            None => entry,
+                        };
+                        if remote.is_empty() {
+                            all = true;
+                            break;
+                        }
+                        state.absorb_name(&remote);
+                    }
+                } else {
+                    all = true;
+                }
+            } else if t2.contains("__honey_idefault(") && t2.ends_with(&format!("({name});")) {
+                state.absorb_name("default");
+            } else if t2.ends_with(&tail) {
+                // `var ns = __honey_m0;` namespace binding
+                all = true;
+            } else {
+                all = true; // unknown consumer shape
+            }
+            if all {
+                break;
+            }
+        }
+        let usage = if all {
+            ExportUsage::All
+        } else if state.names.is_empty() {
+            ExportUsage::SideEffect
+        } else {
+            ExportUsage::Named(state.names)
+        };
+        real.push(DepUse { dep: dep.clone(), usage });
+    }
+
+    ModuleUse { real, rewires }
+}
+
+/// True when the transformed module's top level can never observe effects:
+/// top-level statements are only declarations (`export const x = 5`,
+/// `function f() {}`) and expressions that are pure, except for the
+/// bundler's own wiring (`exports[...] = ...`, `__honey_require("[d]")`).
+/// Used to decide whether a fully-dead export-from require may be deleted
+/// outright (dep never evaluates) or must degrade to a bare require line.
+fn module_is_side_effect_free(code: &str) -> bool {
+    use oxc_allocator::Allocator;
+    use oxc_ast::AstKind;
+    use oxc_ast::ast::AssignmentOperator;
+    use oxc_parser::Parser;
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::{GetSpan as _, SourceType};
+
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, code, SourceType::cjs()).parse();
+    if ret.panicked || !ret.errors.is_empty() {
+        return false;
+    }
+    let semantic = SemanticBuilder::new()
+        .with_scope_tree_child_ids(false)
+        .with_check_syntax_error(false)
+        .build(&ret.program)
+        .semantic;
+
+    // Spans of function bodies: nodes inside them never run at top level.
+    let mut body_spans: Vec<oxc_span::Span> = Vec::new();
+    for node in semantic.nodes() {
+        match node.kind() {
+            AstKind::Function(f) => {
+                if let Some(b) = f.body.as_ref() {
+                    body_spans.push(b.span);
+                }
+            }
+            AstKind::ArrowFunctionExpression(a) => body_spans.push(a.body.span),
+            AstKind::StaticBlock(b) => body_spans.push(b.span),
+            _ => {}
+        }
+    }
+    let inside_fn_body = |s: oxc_span::Span| {
+        body_spans
+            .iter()
+            .any(|b| s.start > b.start && s.end <= b.end)
+    };
+
+    for node in semantic.nodes() {
+        let span = node.span();
+        if inside_fn_body(span) {
+            continue;
+        }
+        match node.kind() {
+            // Bundler wiring: exports bookkeeping and dep evaluation are not
+            // module effects.
+            AstKind::AssignmentExpression(a) => {
+                if a.operator == AssignmentOperator::Assign {
+                    let raw = code.get(a.span.start as usize..).unwrap_or("").trim_start();
+                    if raw.starts_with("exports[") || raw.starts_with("exports.") {
+                        continue;
+                    }
+                }
+                return false;
+            }
+            AstKind::CallExpression(c) => {
+                let is_wiring = matches!(&c.callee, oxc_ast::ast::Expression::Identifier(i)
+                    if i.name.starts_with("__honey_"));
+                if !is_wiring {
+                    return false;
+                }
+            }
+            // Anything dynamic or lifecycle-bearing at top level is an
+            // effect. Be conservative. Member reads on the `exports` object
+            // (also members that are the LHS of wiring assignments visited
+            // as separate nodes) are bundler wiring, not module effects.
+            AstKind::MemberExpression(m) => {
+                let raw = code.get(m.span().start as usize..).unwrap_or("").trim_start();
+                if !(raw.starts_with("exports[") || raw.starts_with("exports.")) {
+                    return false;
+                }
+            }
+            | AstKind::UpdateExpression(_)
+            | AstKind::AwaitExpression(_)
+            | AstKind::YieldExpression(_)
+            | AstKind::TaggedTemplateExpression(_)
+            | AstKind::ImportExpression(_)
+            | AstKind::ChainExpression(_)
+            | AstKind::IfStatement(_)
+            | AstKind::ForStatement(_)
+            | AstKind::ForInStatement(_)
+            | AstKind::ForOfStatement(_)
+            | AstKind::WhileStatement(_)
+            | AstKind::DoWhileStatement(_)
+            | AstKind::SwitchStatement(_)
+            | AstKind::ThrowStatement(_)
+            | AstKind::TryStatement(_)
+            | AstKind::Class(_)
+            | AstKind::ReturnStatement(_)
+            | AstKind::DebuggerStatement(_) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+struct TreeShake {
+    /// Modules whose factory is emitted (reachable in the pruned graph).
+    kept: std::collections::HashSet<String>,
+    /// Module id -> pruned factory code (only where lines were removed).
+    pruned: HashMap<String, String>,
+}
+
+/// Cross-module used-export analysis + per-module line pruning. The pass only
+/// ever removes generator-produced lines (export epilogue assignments and
+/// dead export-from require temps); anything it cannot describe precisely is
+/// treated as All and left untouched. JS modules without their own sourcemap
+/// are line-pruned; TS modules (with a map) drop out only as whole factories,
+/// so sourcemap token offsets never shift. Every pruned module is re-parsed
+/// as a safety net; a parse failure falls back to the unpruned code.
+fn tree_shake(bundler: &Bundler, entry_id: &str) -> TreeShake {
+    use std::collections::HashSet;
+
+    struct State {
+        esm: bool,
+        reached: bool,
+        used: UsedExports,
+    }
+
+    // -- stage 1: extract uses and run the fixpoint from the entry ----------
+    let mut uses: HashMap<&str, ModuleUse> = HashMap::new();
+    let mut states: HashMap<&str, State> = HashMap::new();
+    for (id, m) in &bundler.modules {
+        // CJS deps: arbitrary export-assignment code — anything reaching
+        // them upgrades to All inside the loop below (esm=false).
+        let mu = extract_module_use(&m.code);
+        states.insert(
+            id.as_str(),
+            State { esm: m.esm, reached: false, used: UsedExports::default() },
+        );
+        uses.insert(id.as_str(), mu);
+    }
+    states.get_mut(entry_id).expect("entry in graph").reached = true;
+    // Entry exports stay intact: the bundle host may import them.
+    states.get_mut(entry_id).expect("entry in graph").used.all = true;
+
+    let ids: Vec<&str> = states.keys().copied().collect();
+    loop {
+        let mut changed = false;
+        for id in &ids {
+            let (reached, m_all, m_names) = {
+                let st = &states.get(id).expect("state present");
+                (st.reached, st.used.all, st.used.names.clone())
+            };
+            if !reached {
+                continue;
+            }
+            let mu = uses.get(id).expect("uses present");
+            for u in &mu.real {
+                let Some(dep) = states.get_mut(u.dep.as_str()) else { continue };
+                if !dep.reached {
+                    dep.reached = true;
+                    changed = true;
+                }
+                if !dep.esm {
+                    changed |= dep.used.absorb(&ExportUsage::All);
+                } else {
+                    changed |= dep.used.absorb(&u.usage);
+                }
+            }
+            for r in &mu.rewires {
+                let Some(dep) = states.get_mut(r.dep.as_str()) else { continue };
+                if !dep.reached {
+                    dep.reached = true;
+                    changed = true;
+                }
+                // The re-export is live only when this module's export k is
+                // itself read (directly or through another rewire chain).
+                if m_all || m_names.iter().any(|n| n == &r.k) {
+                    if dep.esm {
+                        changed |= dep.used.absorb_name(&r.remote);
+                    } else {
+                        changed |= dep.used.absorb(&ExportUsage::All);
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if std::env::var("HONEY_TS_DEBUG").is_ok() {
+        for (id, st) in &states {
+            eprintln!("[ts] {id} esm={} reached={} all={} names={:?}", st.esm, st.reached, st.used.all, st.used.names);
+        }
+        for (id, mu) in &uses {
+            eprintln!("[ts-use] {id} real={:?} rewires={:?}", mu.real.iter().map(|u| (u.dep.clone(), match &u.usage { ExportUsage::All => "ALL", ExportUsage::Default => "default", ExportUsage::Named(v) => { let s: Vec<&str> = v.iter().map(|x| x.as_str()).collect(); Box::leak(s.join(",").into_boxed_str()) } , ExportUsage::SideEffect => "side" })).collect::<Vec<_>>(), mu.rewires.iter().map(|r| (r.k.clone(), r.dep.clone(), r.remote.clone())).collect::<Vec<_>>());
+        }
+    }
+
+    // -- stage 2: prune export wiring from provably-narrow modules ----------
+    let mut pruned: HashMap<String, String> = HashMap::new();
+    let mut purity: HashMap<String, bool> = HashMap::new();
+    for (key, st) in &states {
+        let id = *key;
+        if id == entry_id || !st.esm || st.used.all {
+            continue;
+        }
+        let Some(m) = bundler.modules.get(id) else { continue };
+        let my_names = &st.used.names;
+        let has_prunable = m.code.split('\n').any(|line| {
+            let Some(rest) = line.trim_start().strip_prefix("exports[") else {
+                return false;
+            };
+            let Some((k, _)) = parse_export_line(rest) else {
+                return false;
+            };
+            !my_names.iter().any(|n| n == &k)
+        });
+        if !has_prunable {
+            continue;
+        }
+        let mut lines: Vec<String> = m.code.split('\n').map(String::from).collect();
+        lines.retain(|line| {
+            let Some(rest) = line.trim_start().strip_prefix("exports[") else {
+                return true;
+            };
+            let Some((k, _)) = parse_export_line(rest) else {
+                return true;
+            };
+            my_names.iter().any(|n| n == &k)
+        });
+        // Dead export-from temps: `var __honey_rN = __honey_require("d");`
+        // with no surviving `__honey_rN[` reader. A dep with top-level
+        // effects must still be evaluated — degrade it to a bare require
+        // line; a pure dep may vanish outright.
+        for li in 0..lines.len() {
+            let t = lines[li].trim().to_string();
+            let Some(rest) = t.strip_prefix("var ") else { continue };
+            let Some((name, rhs)) = split_var_eq(rest) else { continue };
+            if temp_kind(name) != Some(TempKind::R) {
+                continue;
+            }
+            let Some(dep_id) = rhs_requires(rhs) else { continue };
+            let decl_line = lines[li].clone();
+            if lines
+                .iter()
+                .any(|l2| l2.as_str() != decl_line.as_str() && l2.contains(&format!("{name}[")))
+            {
+                continue; // still read by surviving re-exports
+            }
+            if !bundler.modules.contains_key(&dep_id) {
+                continue;
+            }
+            let pure = *purity.entry(dep_id.clone()).or_insert_with(|| {
+                let dep_code = bundler
+                    .modules
+                    .get(&dep_id)
+                    .map(|m| m.code.clone())
+                    .unwrap_or_default();
+                module_is_side_effect_free(&dep_code)
+            });
+            if pure {
+                lines[li] = String::new();
+            } else {
+                lines[li] = format!("__honey_require({});", json_str(&dep_id));
+            }
+        }
+        let code3 = lines.join("\n");
+        // Safety net: the pruned module must still parse. Anything mangled
+        // falls back to the unpruned code — pruning never breaks a bundle.
+        {
+            use oxc_allocator::Allocator;
+            use oxc_parser::Parser;
+            use oxc_span::SourceType;
+            let allocator = Allocator::default();
+            let ret = Parser::new(&allocator, &code3, SourceType::cjs()).parse();
+            if ret.panicked || !ret.errors.is_empty() {
+                continue;
+            }
+        }
+        pruned.insert(id.to_string(), code3);
+    }
+    let _ = &purity;
+
+    // -- stage 3: final reachability over the PRUNED graph ------------------
+    let mut kept: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    kept.insert(entry_id.to_string());
+    queue.push_back(entry_id.to_string());
+    while let Some(cur) = queue.pop_front() {
+        let code = pruned
+            .get(&cur)
+            .cloned()
+            .unwrap_or_else(|| {
+                bundler
+                    .modules
+                    .get(&cur)
+                    .map(|m| m.code.clone())
+                    .unwrap_or_default()
+            });
+        let mu = extract_module_use(&code);
+        for u in mu.real {
+            if bundler.modules.contains_key(&u.dep) && kept.insert(u.dep.clone()) {
+                queue.push_back(u.dep);
+            }
+        }
+        for r in mu.rewires {
+            if bundler.modules.contains_key(&r.dep) && kept.insert(r.dep.clone()) {
+                queue.push_back(r.dep);
+            }
+        }
+    }
+
+    // Drop prune results for modules that fell out of the graph anyway.
+    pruned.retain(|id, _| kept.contains(id));
+    TreeShake { kept, pruned }
+}
+// ---------------------------------------------------------------------------
 // Bundle emission
 // ---------------------------------------------------------------------------
 
@@ -2455,6 +3214,15 @@ fn minify_css(css: &str) -> String {
 /// absolute path, CommonJS semantics (partial exports on cycles), entry
 /// module required last.
 fn emit_bundle(bundler: &mut Bundler, entry_id: &str, opts: &BuildOptions) -> (String, Option<oxc_sourcemap::SourceMap>) {
+    // Used-export tree-shaking (Cinnamon v2): prune unused export wiring and
+    // drop side-effect-free modules that fell out of the graph. Runs before
+    // emission so factory code is final when line offsets are computed.
+    let shake = tree_shake(bundler, entry_id);
+    for (id, code) in &shake.pruned {
+        if let Some(m) = bundler.modules.get_mut(id) {
+            m.code = code.clone();
+        }
+    }
     let mut out = String::new();
     out.push_str("// generated by `honey build` (Cinnamon v1 bundler)\n");
     out.push_str("// modules keyed by resolved absolute path; CommonJS registry semantics;\n");
@@ -2471,6 +3239,9 @@ fn emit_bundle(bundler: &mut Bundler, entry_id: &str, opts: &BuildOptions) -> (S
     }
     out.push_str("var __honey_defs = {\n");
     for id in &bundler.order {
+        if !shake.kept.contains(id) {
+            continue; // tree-shaken out: unreachable after export pruning
+        }
         let m = bundler.modules.get_mut(id).expect("module present");
         out.push_str(&format!(
             "  {}: {{ dir: {}, factory: function (module, exports, require) {{\n",
@@ -2536,6 +3307,7 @@ function __honey_require(id) {
     let maps: Vec<(String, oxc_sourcemap::SourceMap)> = bundler
         .order
         .iter()
+        .filter(|id| shake.kept.contains(*id))
         .filter_map(|id| {
             bundler
                 .modules
