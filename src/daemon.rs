@@ -1477,91 +1477,18 @@ fn run_batch(jobs: &[(String, String)], cwd: &str) -> Vec<Response> {
 
 // ---------- test watch mode ----------
 
-/// Watch one test file itself plus its parent directory (file watches catch
-/// in-place writes; dir watches catch atomic saves and new files). Returns
-/// the watch descriptor, recorded so inotify events can be mapped back to
-/// the affected test file.
-fn inotify_watch(
-    fd: i32,
-    path: &std::path::Path,
-    watches: &mut std::collections::HashSet<String>,
-    wd_dirs: &mut std::collections::HashMap<i32, String>,
-) {
-    for p in [path.to_path_buf(), path.parent().map(|d| d.to_path_buf()).unwrap_or_default()] {
-        if p.as_os_str().is_empty() {
-            continue;
-        }
-        let dir = p.to_string_lossy().into_owned();
-        if !watches.insert(dir.clone()) {
-            continue;
-        }
-        let Some(c) = std::ffi::CString::new(dir.clone()).ok() else { continue };
-        let wd = unsafe { libc::inotify_add_watch(fd, c.as_ptr(), WATCH_MASK) };
-        if wd >= 0 {
-            wd_dirs.insert(wd, dir);
-        }
-    }
-}
-
-/// Read one batch of inotify events (the fd is non-blocking) and return the
-/// watched file paths the events refer to.
-fn inotify_changed_files(
-    fd: i32,
-    files: &std::collections::HashSet<String>,
-    wd_dirs: &std::collections::HashMap<i32, String>,
-) -> Vec<String> {
-    let mut buf = [0u8; 8192];
-    let n = unsafe {
-        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-    };
-    if n <= 0 {
-        return vec![];
-    }
-    let n = n as usize;
-    let mut changed = std::collections::BTreeSet::new();
-    let mut off = 0usize;
-    while off + 16 <= n {
-        let wd = i32::from_ne_bytes(buf[off..off + 4].try_into().unwrap());
-        let mask = u32::from_ne_bytes(buf[off + 4..off + 8].try_into().unwrap());
-        let _cookie = u32::from_ne_bytes(buf[off + 8..off + 12].try_into().unwrap());
-        let len = u32::from_ne_bytes(buf[off + 12..off + 16].try_into().unwrap()) as usize;
-        off += 16;
-        let name_end = (off + len).min(n);
-        let raw = &buf[off..name_end];
-        off += len;
-        let name = raw.split(|b| *b == 0).next().unwrap_or(&[]);
-        if name.is_empty() && mask & libc::IN_ISDIR != 0 {
-            continue; // directory event without a name: not a test file
-        }
-        let Some(dir) = wd_dirs.get(&wd) else { continue };
-        let candidate = if name.is_empty() {
-            dir.clone()
-        } else {
-            format!(
-                "{}/{}",
-                dir.trim_end_matches('/'),
-                String::from_utf8_lossy(name)
-            )
-        };
-        if files.contains(&candidate) {
-            changed.insert(candidate);
-        }
-    }
-    changed.into_iter().collect()
-}
-
 /// Long-lived test watch session for `honey test --watch`: run the batch
 /// (one worker subprocess per file, up to num_cpus concurrent), stream one
 /// response frame per file plus a batch-summary marker frame, then watch the
-/// test files with inotify; an edit re-runs only the affected files. Events
-/// that land mid-run are consumed by the post-run drain, so one editor save
-/// yields exactly one re-run. Ends when the client disconnects.
+/// test files (inotify on Linux, kqueue on macOS); an edit re-runs only the
+/// affected files. Events that land mid-run are consumed by the post-run
+/// drain, so one editor save yields exactly one re-run. Ends when the client
+/// disconnects.
 fn watch_test_session(stream: &mut UnixStream, request: &Request) {
     use std::os::unix::io::AsRawFd;
-    let ifd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK) };
-    if ifd < 0 {
+    let Some(mut watcher) = crate::watch::FileWatcher::new() else {
         return;
-    }
+    };
     let cwd = request.cwd.clone();
     let jobs: Vec<(String, String)> = request
         .args
@@ -1592,19 +1519,17 @@ fn watch_test_session(stream: &mut UnixStream, request: &Request) {
         });
         trace_log("test watch: batch done, armed, awaiting events");
 
-        let mut watches = std::collections::HashSet::new();
-        let mut wd_dirs = std::collections::HashMap::new();
         for (file, _) in &jobs {
-            inotify_watch(ifd, std::path::Path::new(file), &mut watches, &mut wd_dirs);
+            watcher.watch_file(file);
         }
         // Events from before this point describe the run we just did.
-        drain_inotify(ifd);
+        watcher.drain();
 
         // Wait for the next relevant event or the client hanging up.
         loop {
             let mut pfds = [
-                libc::pollfd { fd: ifd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: cfd, events: libc::POLLIN | libc::POLLRDHUP, revents: 0 },
+                libc::pollfd { fd: watcher.fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: cfd, events: client_poll_events(), revents: 0 },
             ];
             let r = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
             if r < 0 {
@@ -1613,7 +1538,7 @@ fn watch_test_session(stream: &mut UnixStream, request: &Request) {
                 }
                 break 'sessions;
             }
-            if pfds[1].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+            if pfds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
                 break 'sessions; // client went away (Ctrl+C)
             }
             if pfds[1].revents & libc::POLLIN != 0 {
@@ -1622,8 +1547,8 @@ fn watch_test_session(stream: &mut UnixStream, request: &Request) {
             if pfds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 // The post-run drain already consumed this event batch; read
                 // whatever event payload this single read yields.
-                let changed = inotify_changed_files(ifd, &file_set, &wd_dirs);
-                drain_inotify(ifd);
+                let changed = watcher.poll_changed(&file_set);
+                watcher.drain();
                 if changed.is_empty() {
                     continue; // unrelated file event (editor temp etc.); keep waiting
                 }
@@ -1637,7 +1562,7 @@ fn watch_test_session(stream: &mut UnixStream, request: &Request) {
             }
         }
     }
-    unsafe { libc::close(ifd); }
+    watcher.close();
 }
 
 // ---------- stdio capture ----------
@@ -1834,36 +1759,16 @@ pub fn capture_stdio<T>(f: impl FnOnce() -> T) -> (String, String, T) {
 
 // ---------- watch mode ----------
 
-/// What we subscribe to: content edits, attribute/mtime bumps, creates,
-/// deletes and renames. Directory watches catch atomic saves (delete+rename)
-/// and new files; per-file watches catch plain in-place writes.
-const WATCH_MASK: u32 = libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_CREATE
-    | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE
-    | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
-
-fn inotify_add_dir(fd: i32, dir: &str, watches: &mut std::collections::HashSet<String>) {
-    if !watches.insert(dir.to_string()) {
-        return;
-    }
-    let c = std::ffi::CString::new(dir).ok();
-    if let Some(c) = c {
-        unsafe { libc::inotify_add_watch(fd, c.as_ptr(), WATCH_MASK) };
-    }
+/// What the client socket subscribes to in a watch session. POLLRDHUP is
+/// Linux-only; on macOS, POLLHUP/POLLERR in revents carry the hangup.
+#[cfg(target_os = "linux")]
+fn client_poll_events() -> i16 {
+    libc::POLLIN | libc::POLLRDHUP
 }
 
-fn drain_inotify(fd: i32) {
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = unsafe {
-            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
-        if n <= 0 {
-            break; // fully drained (EAGAIN or error; fd is non-blocking)
-        }
-        if (n as usize) < buf.len() {
-            break;
-        }
-    }
+#[cfg(not(target_os = "linux"))]
+fn client_poll_events() -> i16 {
+    libc::POLLIN
 }
 
 fn abs_main_path(request: &Request) -> String {
@@ -1879,23 +1784,19 @@ fn abs_main_path(request: &Request) -> String {
 }
 
 /// Long-lived watch session: run, stream one response frame, wait for file
-/// events via inotify (no polling), re-run on the warm engine, repeat. Any
-/// events that arrive mid-run are consumed by the post-run drain, so one
-/// editor save yields exactly one re-run. Ends when the client disconnects.
+/// events via the platform watcher (inotify on Linux, kqueue on macOS; no
+/// polling), re-run on the warm engine, repeat. Any events that arrive
+/// mid-run are consumed by the post-run drain, so one editor save yields
+/// exactly one re-run. Ends when the client disconnects.
 fn watch_session(
     stream: &mut UnixStream,
     request: &Request,
     run_tx: &std::sync::mpsc::Sender<RunJob>,
 ) {
     use std::os::unix::io::AsRawFd;
-    // Non-blocking: the post-run drain must return immediately when there is
-    // nothing pending; a blocking fd would wait for the next real event and
-    // swallow it.
-    let ifd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK) };
-    if ifd < 0 {
+    let Some(mut watcher) = crate::watch::FileWatcher::new() else {
         return;
-    }
-    let mut watches = std::collections::HashSet::new();
+    };
     let cfd = stream.as_raw_fd();
     'sessions: loop {
         // Every refresh runs on the dedicated run-engine thread.
@@ -1919,21 +1820,21 @@ fn watch_session(
             deps.push((main.clone(), m));
         }
         for (path, _) in &deps {
-            inotify_add_dir(ifd, path, &mut watches);
+            watcher.watch_path(path);
             if let Some(dir) = std::path::Path::new(path).parent() {
                 let dir = dir.to_string_lossy().into_owned();
-                inotify_add_dir(ifd, &dir, &mut watches);
+                watcher.watch_path(&dir);
             }
         }
         // Events from before this point describe the run we just did.
-        drain_inotify(ifd);
+        watcher.drain();
         trace_log("watch: armed, awaiting events");
 
         // Wait for the next relevant event or the client hanging up.
         loop {
             let mut pfds = [
-                libc::pollfd { fd: ifd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: cfd, events: libc::POLLIN | libc::POLLRDHUP, revents: 0 },
+                libc::pollfd { fd: watcher.fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: cfd, events: client_poll_events(), revents: 0 },
             ];
             let r = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
             if r < 0 {
@@ -1942,7 +1843,7 @@ fn watch_session(
                 }
                 break 'sessions;
             }
-            if pfds[1].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+            if pfds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
                 break 'sessions; // client went away (Ctrl+C)
             }
             if pfds[1].revents & libc::POLLIN != 0 {
@@ -1954,7 +1855,7 @@ fn watch_session(
             }
         }
     }
-    unsafe { libc::close(ifd); }
+    watcher.close();
 }
 
 // ---------- client ----------

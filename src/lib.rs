@@ -7,6 +7,7 @@ pub mod package;
 pub mod registry;
 pub mod runtime;
 pub mod service;
+pub mod watch;
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
