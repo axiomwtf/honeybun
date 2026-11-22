@@ -127,8 +127,13 @@ pub fn fire(hook: &str, ctx_json: &str) -> Option<String> {
         }
     };
     match outcome {
-        Some(r) => r.ok().flatten(),
-        None => None,
+        // Advisory result: surface it on stderr so command stdout stays
+        // parseable while the hook is still visible.
+        Some(Ok(Some(value))) => {
+            eprintln!("honey: {hook} hook: {value}");
+            Some(value)
+        }
+        r => r.and_then(|o| o.ok().flatten()),
     }
 }
 

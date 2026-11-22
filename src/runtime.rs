@@ -827,7 +827,11 @@ impl HoneyModuleLoader {
     ) -> Result<ModuleSpecifier, AnyError> {
         // Bare npm package specifiers (e.g. dynamic import("@humanfs/node"))
         // resolve through our CJS/npm resolver instead of URL joins.
-        let is_url = specifier.contains("://") || specifier.starts_with("data:");
+        let is_url = specifier.contains("://")
+            || specifier.starts_with("data:")
+            // honey's synthetic module specifiers (e.g. honey:preload/<seq>
+            // for the ESM test wrapper): no file on disk, opaque as-is.
+            || specifier.starts_with("honey:");
         let is_pathish = specifier.starts_with("./")
             || specifier.starts_with("../")
             || specifier.starts_with('/')
@@ -845,7 +849,13 @@ impl HoneyModuleLoader {
             }
         }
 
-        let referrer_url = if referrer == "." {
+        // honey's synthetic specifiers (honey:preload/<seq>, the ESM test
+        // wrapper) are opaque, cannot act as URL-join bases, and their
+        // absolute-path imports must resolve against the real filesystem.
+        let referrer_url = if referrer.starts_with("honey:") {
+            let cwd = std::env::current_dir().context("failed to get current directory")?;
+            ModuleSpecifier::from_file_path(&cwd).unwrap()
+        } else if referrer == "." {
             let cwd = std::env::current_dir()
                 .context("failed to get current directory")?;
             ModuleSpecifier::from_file_path(&cwd).unwrap()
@@ -931,6 +941,19 @@ impl ModuleLoader for HoneyModuleLoader {
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let spec_str = module_specifier.as_str();
+
+        // honey's synthetic specifiers (honey:preload/<seq>, the ESM test
+        // wrapper): the source is registered via load_main_es_module_from_code,
+        // so any transitive load request just yields empty code.
+        if spec_str.starts_with("honey:") {
+            let module_source = ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(ModuleCodeString::from(String::new())),
+                module_specifier,
+                None,
+            );
+            return ModuleLoadResponse::Sync(Ok(module_source));
+        }
 
         // node:* and bare builtin names: bridge ESM imports to our CJS builtins
         if spec_str.starts_with("node:") || is_builtin_name(spec_str) {
