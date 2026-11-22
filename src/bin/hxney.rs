@@ -127,7 +127,7 @@ fn main() {
     {
         const MGMT: &[&str] =
             &["add", "remove", "install", "migrate", "start", "stop", "service"];
-        if MGMT.contains(&argv[1].as_str()) {
+        if argv.len() >= 2 && MGMT.contains(&argv[1].as_str()) {
             let exe = std::env::current_exe().unwrap_or_default();
             let honey = exe.with_file_name("honey");
             use std::os::unix::process::CommandExt as _;

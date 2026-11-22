@@ -23,6 +23,15 @@ struct Cli {
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
 
+    // Bare `hxney`: drop into the interactive JS shell until `exit`.
+    if argv.len() == 1 {
+        if let Err(e) = run_shell() {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `hxney npm <args>`: npm-style package management, backed by a bundled
     // npm living in the shared package store. Handled before Cli::parse so
     // npm's own flags (-g etc.) pass through untouched.
@@ -43,6 +52,124 @@ fn main() {
     }
 }
 
+/// Bare `hxney`: an interactive JS shell on the warm engine. Completion
+/// values are echoed, session state (vars, functions, requires) persists
+/// across lines, unbalanced brackets continue on the next line. `exit`,
+/// `.exit`, `quit` or Ctrl-D leaves.
+fn run_shell() -> Result<()> {
+    use std::io::{BufRead as _, Write as _};
+    println!("hxney {} \u{1F40D} type JavaScript, `exit` to leave", env!("CARGO_PKG_VERSION"));
+    let runtime = honey::runtime::Runtime::new_warm();
+    let stdin = std::io::stdin();
+    let mut buffer = String::new();
+    loop {
+        {
+            let mut out = std::io::stdout();
+            if buffer.is_empty() {
+                write!(out, "hxney> ")?;
+            } else {
+                write!(out, "....> ")?;
+            }
+            out.flush()?;
+        }
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            println!();
+            break; // EOF (Ctrl-D)
+        }
+        let trimmed = line.trim();
+        if buffer.is_empty() && matches!(trimmed, "exit" | ".exit" | "quit" | ":q") {
+            break;
+        }
+        buffer.push_str(&line);
+        if !brackets_balanced(&buffer) {
+            continue;
+        }
+        let input = std::mem::take(&mut buffer);
+        let t = input.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Direct eval keeps const/let/class scoped to the eval itself —
+        // invisible to the next line. A leading declaration is rewritten to
+        // `var` (function-scoped, lands on the engine global) so REPL state
+        // persists; declarations further in are left untouched.
+        let runnable = if let Some(rest) = t.strip_prefix("const ") {
+            format!("var {rest}")
+        } else if let Some(rest) = t.strip_prefix("let ") {
+            format!("var {rest}")
+        } else if let Some(rest) = t.strip_prefix("class ") {
+            let name = rest.split(['{', ' ', '\t', '\n']).next().unwrap_or("").trim().to_string();
+            if name.is_empty() {
+                t.to_string()
+            } else {
+                format!("var {name} = {t}")
+            }
+        } else {
+            t.to_string()
+        };
+        // Direct eval: completion value of the input comes back (last
+        // expression), and top-level vars/functions attach to the enclosing
+        // script scope — which is the engine global, so they persist.
+        match runtime.eval_code(&format!("eval({})", serde_json::to_string(&runnable)?)) {
+            Ok(Some(v)) => println!("{v}"),
+            Ok(None) => {}
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Bracket balance for REPL continuation: ignores strings, template
+/// literals, escapes and comments. A heuristic, not a parser.
+fn brackets_balanced(s: &str) -> bool {
+    let mut depth: i64 = 0;
+    let mut in_str: Option<char> = None;
+    let mut escaped = false;
+    let mut in_block = false;
+    let mut in_line = false;
+    let mut prev = '\0';
+    for c in s.chars() {
+        if in_line {
+            if c == '\n' {
+                in_line = false;
+            }
+            prev = c;
+            continue;
+        }
+        if in_block {
+            if prev == '*' && c == '/' {
+                in_block = false;
+                prev = '\0';
+                continue;
+            }
+            prev = c;
+            continue;
+        }
+        if let Some(q) = in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                in_str = None;
+            }
+            prev = c;
+            continue;
+        }
+        match c {
+            '/' if prev == '/' => in_line = true,
+            '*' if prev == '/' => in_block = true,
+            '"' | '\'' | '`' => in_str = Some(c),
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        prev = c;
+    }
+    depth <= 0 && in_str.is_none() && !in_block
+}
+
 /// npm bootstrap: the npm package itself is installed once into the shared
 /// package store (`~/.cache/honey/store/npm@<version>`), same place every
 /// other hxney package lives, then executed with the Node-compatible runner
@@ -58,19 +185,113 @@ fn run_npm(args: &[String]) -> Result<()> {
     let mut cmd = std::process::Command::new(&runner);
     cmd.arg(&cli).args(args);
     let wants_global = args.iter().any(|a| a == "-g" || a == "--global");
-    if wants_global && std::env::var_os("npm_config_prefix").is_none() {
-        if let Some(prefix) = honey::cinm::shared_store_root()
+    // Our npm-global prefix is hxney-owned but not on PATH, so global
+    // commands must be linked into ~/.local/bin after npm finishes.
+    let our_prefix: Option<PathBuf> = if wants_global
+        && std::env::var_os("npm_config_prefix").is_none()
+    {
+        honey::cinm::shared_store_root()
             .parent()
             .map(|p| p.join("npm-global"))
-        {
-            cmd.env("npm_config_prefix", &prefix);
-        }
+    } else {
+        None
+    };
+    if let Some(prefix) = &our_prefix {
+        cmd.env("npm_config_prefix", prefix);
     }
     let status = cmd
         .status()
         .with_context(|| format!("failed to run npm with {}", runner.display()))?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
+    }
+    if let Some(prefix) = &our_prefix {
+        if let Err(e) = sync_global_bins(prefix) {
+            eprintln!(
+                "honey: warning: could not link global commands into ~/.local/bin: {:#}",
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Mirror npm's `<prefix>/bin` shims into `~/.local/bin` so freshly
+/// installed global commands are immediately runnable. Never clobbers
+/// real files (only replaces our own previous symlinks); stale links for
+/// since-removed commands are pruned.
+fn sync_global_bins(prefix: &Path) -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let src = prefix.join("bin");
+    if !src.is_dir() {
+        return Ok(());
+    }
+    let home = std::env::var("HOME").context("no $HOME; cannot link global commands")?;
+    let dest_dir = PathBuf::from(home).join(".local/bin");
+    fs::create_dir_all(&dest_dir).context("failed to create ~/.local/bin")?;
+
+    let mut current: Vec<String> = Vec::new();
+    for entry in fs::read_dir(&src)
+        .with_context(|| format!("failed to read {}", src.display()))?
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Only real executables: skip npm's .cmd/.ps1 Windows shims.
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".cmd") || name.ends_with(".ps1") {
+            continue;
+        }
+        if fs::metadata(&path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+        {
+            current.push(name.clone());
+        }
+    }
+
+    // Prune links we own that no longer have a shim (uninstall/rename).
+    if let Ok(rd) = fs::read_dir(&dest_dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(target) = fs::read_link(&path) else {
+                continue; // not a symlink: never touched
+            };
+            if !target.starts_with(&src) {
+                continue; // somebody else's link
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !current.contains(&name) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
+    // Link every shim; refuse to clobber anything that isn't ours.
+    for name in &current {
+        let link = dest_dir.join(name);
+        match fs::symlink_metadata(&link) {
+            Ok(m) if m.file_type().is_symlink() => {
+                if fs::read_link(&link).map(|t| t.starts_with(&src)).unwrap_or(false) {
+                    continue; // already linked
+                }
+                let _ = fs::remove_file(&link);
+                symlink(src.join(name), &link).with_context(|| {
+                    format!("failed to link {name} into ~/.local/bin")
+                })?;
+            }
+            Ok(_) => {
+                eprintln!("honey: not linking {name}: a real file already exists in ~/.local/bin");
+            }
+            Err(_) => {
+                symlink(src.join(name), &link).with_context(|| {
+                    format!("failed to link {name} into ~/.local/bin")
+                })?;
+            }
+        }
     }
     Ok(())
 }

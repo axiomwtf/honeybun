@@ -15,7 +15,7 @@ honeybun is a single static binary that provides equivalent functionality to npm
 - **One binary.** `honey` is a single static binary. No runtime files. No `.so`. No sidecar.
 - **No Bun code.** No Zig. Rust + upstream V8, newest, unpinned (`deno_core = "0"` — every build takes the latest crates.io release). Clean room implementation.
 - **Daemon-backed speed.** A persistent daemon holds a warm V8 isolate with an mtime-validated module cache. Every `honey run` is an IPC round-trip (~0.2ms) instead of a cold start. Even a fresh engine is cheap: a build-time V8 context snapshot roughly triples engine init speed.
-- **Watch mode.** `honey run --watch file.ts` re-runs on dependency changes via inotify in the daemon (event-driven, no polling) — edit→output refresh in ~1ms on the warm engine. `honey build --watch` is hosted by the daemon too: rebuild frames stream over IPC and the client is a thin relay, so watch mode never pays a cold start either.
+- **Watch mode.** `honey run --watch file.ts` re-runs on dependency changes via the platform watcher in the daemon (inotify on Linux, kqueue on macOS; event-driven, no polling) — edit→output refresh in ~1ms on the warm engine. `honey build --watch` is hosted by the daemon too: rebuild frames stream over IPC and the client is a thin relay, so watch mode never pays a cold start either.
 - **TypeScript-native.** Oxc parser + transformer. TypeScript is transpiled to JavaScript; full type-checking remains tsc's job. `.ts`, `.mts`, `.cts`, `.tsx` and `.jsx` all run directly (`honey run main.tsx`), with extensionless-import resolution and tsconfig `jsx` settings honored.
 - **Node-compatible.** Full compat layer built on upstream `deno_core`. Target: 95%+ of npm packages at v0.1.
 
@@ -24,7 +24,7 @@ honeybun is a single static binary that provides equivalent functionality to npm
 | Name | Role |
 |------|------|
 | `honey` | CLI binary, daemon, package manager |
-| `hxney` | One-off package executor (npx/bunx equivalent) |
+| `hxney` | One-off package executor (npx/bunx), bundled npm, interactive JS shell |
 | `Cinnamon` | Internal engine: compiler, resolver, bundler, minifier |
 | `.cinm` | Module directory (equivalent functionality to `node_modules`) |
 | `node_modules` | Symlink to `.cinm` (interop) |
@@ -40,7 +40,7 @@ honey (CLI, daemon, PM) → Cinnamon (engine) → V8 (upstream, newest) (runtime
 | Component | Role |
 |-----------|------|
 | `honey` | CLI, daemon, package manager |
-| `hxney` | One-off package executor (npx/bunx equivalent) |
+| `hxney` | One-off package executor (npx/bunx), bundled npm, interactive JS shell |
 | `Cinnamon` | Compiler, Resolver, Bundler, Minifier, `.cinm` layout |
 | `V8 (upstream)` | Runtime (newest crates.io `deno_core` + its matched `v8`) |
 
@@ -74,15 +74,19 @@ honey build                # bundle with Cinnamon
 honey build -p             # production: minify + NODE_ENV=production define (DCE) + external sourcemap
 honey build --minify       # minify only
 honey build --sourcemap inline   # linked | external | inline | none
-honey build --watch        # rebuild the bundle on source changes (300ms stat-poll)
+honey build --watch        # rebuild the bundle on source changes (daemon-hosted, live frames)
 honey test                 # run tests
 honey migrate              # JS to TS migration
-hxney <package>           # one-off package executor
+hxney <package>            # one-off package executor (npx/bunx)
+hxney                      # interactive JS shell (type `exit` to leave)
+hxney npm install <pkg>    # npm-style install, npm semantics
+hxney npm install -g <pkg> # global install: bins land on PATH via ~/.local/bin
 ```
 
 ## Package Manager
 
 - Default registry: npm
+- `hxney npm <args>`: npm-style package management backed by npm itself, bundled into the shared package store (`~/.cache/honey/store/npm@<version>`) on first use; `-g` installs stay in `~/.cache/honey/npm-global` with bin shims linked into `~/.local/bin`
 - Lockfile: `honey.lock` (binary format, fast)
 - Can read `package-lock.json` for migration
 - Parallel downloads (tokio) — concurrent BFS waves, `Semaphore(8)`, single atomic lockfile write

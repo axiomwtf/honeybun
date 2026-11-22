@@ -18,7 +18,7 @@ No Bun code. No Zig. Rust + upstream V8, newest, unpinned.
 | Name | Role |
 |------|------|
 | `honey` | CLI binary, daemon, package manager |
-| `hxney` | One-off package executor (npx/bunx equivalent) |
+| `hxney` | One-off package executor (npx/bunx equivalent), bundled npm (`hxney npm`), interactive JS shell (bare `hxney`) |
 | `Cinnamon` | Internal engine: compiler, resolver, bundler, minifier |
 | `.cinm` | Module directory (equivalent functionality to node_modules) |
 | `node_modules` | Symlink to `.cinm` (interop) |
@@ -36,7 +36,7 @@ One static binary. No runtime files. No `.so`. No sidecar.
 | Component | Role |
 |-----------|------|
 | `honey` | CLI, daemon, package manager |
-| `hxney` | One-off package executor (npx/bunx equivalent) |
+| `hxney` | One-off package executor (npx/bunx equivalent), bundled npm (`hxney npm`), interactive JS shell (bare `hxney`) |
 | `Cinnamon` | Compiler, Resolver, Bundler, Minifier, `.cinm` layout |
 | `V8 (upstream)` | Runtime (newest crates.io `deno_core` + its matched `v8`) |
 
@@ -254,8 +254,16 @@ semver 7.x classes (module cycles), dayjs, ms, picocolors):
   ```
   `hxney npm` bootstraps the npm package itself into the shared store
   (`~/.cache/honey/store/npm@<version>`) on first use and runs its CLI on
-  the Node-compatible runner on PATH (node, falling back to bun). `honey
-  install <pkg>` / `-g` is rejected with a pointer to `hxney npm`.
+  the Node-compatible runner on PATH (node, falling back to bun). Global
+  installs live under the hxney-owned prefix (`~/.cache/honey/npm-global`
+  when no user prefix is set) and their bin shims are linked into
+  `~/.local/bin` so installed commands are immediately runnable; uninstall
+  prunes the links. `honey install <pkg>` / `-g` is rejected with a pointer
+  to `hxney npm`.
+- **Interactive shell**: bare `hxney` opens a JS REPL on the warm engine
+  (value echo, persistent session state, multi-line input, `exit` /
+  Ctrl-D to leave). Leading `const`/`let`/`class` declarations are
+  rewritten to persist across lines (eval scoping).
 - Lockfile: `honey.lock` (binary format, fast)
 - Can read `package-lock.json` for migration
 - Parallel downloads (tokio) — implemented: concurrent BFS waves over a `Semaphore(8)`, shared HTTP client, shared-store dedupe, atomic single-write lockfile
