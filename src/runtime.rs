@@ -1825,6 +1825,51 @@ fn builtin_export_list(name: &str) -> &'static [&'static str] {
     }
 }
 
+// ---------- warm CJS code cache ----------
+//
+// V8's serialized bytecode for CJS module bodies. In the daemon the same
+// file is often evaluated many times (watch loops, benchmark batteries,
+// CLI dev cycles); skipping the full parse+bytecode-compile saves
+// ~30-80µs per warm run. Key is a hash of the wrapped source (path +
+// contents + require dir), so an edited file gets a fresh entry for
+// free. Entries are plain bytes and only valid for the current V8
+// version + flags (checked via CachedDataVersionTag).
+
+static CJS_CODE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<u64, (u32, Vec<u8>)>>,
+> = std::sync::OnceLock::new();
+const CJS_CODE_CACHE_MAX: usize = 2048;
+
+fn cjs_code_cache() -> &'static std::sync::Mutex<HashMap<u64, (u32, Vec<u8>)>> {
+    CJS_CODE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn cjs_cache_key(wrapped: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    wrapped.hash(&mut h);
+    h.finish()
+}
+
+fn cjs_cache_get(key: u64) -> Option<Vec<u8>> {
+    let map = cjs_code_cache().lock().ok()?;
+    let (tag, bytes) = map.get(&key)?;
+    if *tag != v8::script_compiler::cached_data_version_tag() {
+        return None;
+    }
+    Some(bytes.clone())
+}
+
+fn cjs_cache_put(key: u64, bytes: Vec<u8>) {
+    let tag = v8::script_compiler::cached_data_version_tag();
+    if let Ok(mut map) = cjs_code_cache().lock() {
+        if map.len() >= CJS_CODE_CACHE_MAX {
+            map.clear(); // simple bound; keys are content-hashed so re-creating is safe
+        }
+        map.insert(key, (tag, bytes));
+    }
+}
+
 fn require_module_internal(
     scope: &mut v8::PinScope,
     module_name: &str,
@@ -2077,11 +2122,57 @@ return (function(exports, require, module, __filename, __dirname) {{
         // an inner TryCatch here the exception is never observed by the
         // require machinery and the module silently "succeeds".
         v8::tc_scope!(let tc_compile, scope);
-        match v8::Script::compile(tc_compile, code, Some(&origin)) {
-            Some(s) => s,
+        // Warm path: reuse V8's serialized bytecode for this exact module
+        // body (same text hash) when we have it; cold path: compile fresh
+        // and store the produced cache for next time.
+        let cache_key = cjs_cache_key(&wrapped);
+        let cached = cjs_cache_get(cache_key);
+        let mut script: Option<v8::Local<v8::Script>> = if let Some(bytes) = &cached {
+            let mut source = v8::script_compiler::Source::new_with_cached_data(
+                code,
+                Some(&origin),
+                v8::script_compiler::CachedData::new(bytes),
+            );
+            v8::script_compiler::compile(
+                tc_compile,
+                &mut source,
+                v8::script_compiler::CompileOptions::ConsumeCodeCache,
+                v8::script_compiler::NoCacheReason::NoReason,
+            )
+        } else {
+            let mut source = v8::script_compiler::Source::new(code, Some(&origin));
+            v8::script_compiler::compile(
+                tc_compile,
+                &mut source,
+                v8::script_compiler::CompileOptions::NoCompileOptions,
+                v8::script_compiler::NoCacheReason::NoReason,
+            )
+        };
+        if script.is_none() && cached.is_some() {
+            // Stale/rejected serialized data: fall back to a clean compile.
+            let mut fresh = v8::script_compiler::Source::new(code, Some(&origin));
+            script = v8::script_compiler::compile(
+                tc_compile,
+                &mut fresh,
+                v8::script_compiler::CompileOptions::NoCompileOptions,
+                v8::script_compiler::NoCacheReason::NoReason,
+            );
+        }
+        match script {
+            Some(s) => {
+                if cached.is_none() {
+                    // Produce the bytecode blob once, for every future warm
+                    // run of this module body in this daemon.
+                    let ub = s.get_unbound_script(tc_compile);
+                    if let Some(cd) = ub.create_code_cache() {
+                        cjs_cache_put(cache_key, cd.to_vec());
+                    }
+                }
+                s
+            }
             None => {
                 global.set(tc_compile, module_key.into(), prev_module_val.unwrap_or(undefined.into()));
-                MODULE_DIR.with(|d| d.replace(previous_dir));
+                MODULE_DIR.with(|d| d.replace(previous_dir.clone()));
                 tc_compile.rethrow();
                 return;
             }

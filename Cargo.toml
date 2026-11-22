@@ -6,8 +6,15 @@ authors = ["AXIOM"]
 # dont add a description
 
 [[bin]]
+# Thin launcher: the shipped `honey`. No V8, ~1MB — `honey run` pays almost
+# nothing for exec; every other command execv's into honey-full below.
 name = "honey"
-path = "src/main.rs"
+path = "src/bin/honey.rs"
+
+[[bin]]
+# The full CLI + engine (all commands, inline fallback execution, daemon).
+name = "honey-full"
+path = "src/bin/honey-full.rs"
 
 [[bin]]
 name = "hxney"
