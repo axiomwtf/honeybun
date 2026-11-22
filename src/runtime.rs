@@ -636,8 +636,32 @@ pub fn make_snapshot_blob() -> Vec<u8> {
     boxed.into_vec()
 }
 
+// deno_core captures the ambient tokio handle when a JsRuntime is created
+// and spawns every delayed V8 task (timers, GC background tasks) onto it.
+// Building an engine with no tokio context — e.g. on a daemon's plain std
+// thread — makes deno_core abort() the whole process the first time V8
+// posts a delayed task. Entering a process-wide tokio runtime here fixes
+// that for every engine built off a plain thread (daemon, test workers).
+// The EnterGuard only needs to outlive JsRuntime::new: deno_core clones
+// the handle and keeps it in the isolate entry.
+static GLOBAL_TOKIO_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+fn enter_tokio_ctx() -> Option<tokio::runtime::EnterGuard<'static>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return None;
+    }
+    let rt = GLOBAL_TOKIO_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build global tokio runtime for engine context")
+    });
+    Some(rt.enter())
+}
+
 /// Build a fresh JsRuntime with the honey core extension.
 fn build_runtime() -> JsRuntime {
+    let _tokio_ctx = enter_tokio_ctx();
     apply_v8_flags();
     let extension = Extension {
         name: "honey:core",
@@ -1358,9 +1382,15 @@ fn require_callback(
     require_module_internal(scope, &module_name, &mut rv);
 }
 
-/// Walk up from `from` looking for the nearest package.json and report whether
-/// it declares `"type": "module"` (default is CommonJS).
-fn nearest_package_json_is_module(from: &Path) -> bool {
+/// Client-side test wrapper builder (used by `honey --watch` and, on the
+/// daemon side, by every test batch). Is ROOTED here so the daemon can build
+/// wrappers itself — clients no longer read every test file twice per run.
+pub fn snapshot_update_enabled() -> bool {
+    matches!(std::env::var("HONEY_SNAPSHOT_UPDATE").as_deref(), Ok("1"))
+}
+
+/// Nearest package.json "type": "module" (mirrors the runtime's own check).
+pub fn nearest_package_json_is_module(from: &Path) -> bool {
     let mut dir = from.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     loop {
         let pkg = dir.join("package.json");
@@ -1380,6 +1410,76 @@ fn nearest_package_json_is_module(from: &Path) -> bool {
             return false;
         }
     }
+}
+
+thread_local! {
+    /// (path, mtime) -> ESM? cache for the test wrapper builder. Content
+    /// changes bump mtime, so a static map keyed on both is safe.
+    static TEST_ESM_CACHE: RefCell<HashMap<(std::path::PathBuf, Option<(i64, u32)>), bool>> = RefCell::new(HashMap::new());
+}
+
+/// The ESM/CJS flavor the engine will use for a main module (mirrors the
+/// runtime's decision: .mjs/.mts, nearest package.json "type", source sniff).
+pub fn main_module_is_esm(path: &std::path::Path) -> bool {
+    if let Some(ext) = path.extension() {
+        if ext == "mjs" || ext == "mts" {
+            return true;
+        }
+    }
+    if nearest_package_json_is_module(path) {
+        return true;
+    }
+    let mtime = stat_mtime(&path.to_string_lossy());
+    let key = (path.to_path_buf(), mtime);
+    if let Some(hit) = TEST_ESM_CACHE.with(|c| c.borrow().get(&key).copied()) {
+        return hit;
+    }
+    let esm = match std::fs::read_to_string(path) {
+        Ok(source) => looks_like_esm(&source),
+        Err(_) => false,
+    };
+    TEST_ESM_CACHE.with(|c| c.borrow_mut().insert(key, esm));
+    esm
+}
+
+/// The JS wrapper loaded instead of a test file: it installs the shim, then
+/// loads the actual test module, so shim and tests share one engine. The
+/// load is `require(...)` (CJS wrapper) or `await import(...)` (ESM wrapper,
+/// `export {}` marks it ESM for the engine's sniff).
+pub fn test_preload_for(path: &std::path::Path) -> Option<String> {
+    test_preload_for_with_snapshot(path, snapshot_update_enabled())
+}
+
+/// Daemon variant: the client's snapshot-update flag rides the request, since
+/// the daemon's own environment doesn't carry HONEY_SNAPSHOT_UPDATE.
+pub fn test_preload_for_snapshot(path: &std::path::Path, snapshot_update: bool) -> Option<String> {
+    test_preload_for_with_snapshot(path, snapshot_update)
+}
+
+fn test_preload_for_with_snapshot(path: &std::path::Path, snapshot_update: bool) -> Option<String> {
+    let path_str = path.to_string_lossy().into_owned();
+    let esm = main_module_is_esm(path);
+    let prologue = format!(
+        "globalThis.__HONEY_TEST_FILE = {};\nglobalThis.__HONEY_SNAPSHOT_UPDATE = {};\n",
+        serde_json::to_string(&path_str).ok()?,
+        snapshot_update
+    );
+    let load = if esm {
+        format!("await import({});\n", serde_json::to_string(&path_str).ok()?)
+    } else {
+        format!("require({});\n", serde_json::to_string(&path_str).ok()?)
+    };
+    let esm_marker = if esm { "export {};\n" } else { "" };
+    // V2: the shim itself is registered once per engine (see runtime.rs's
+    // TEST_SHIM / execute_pending_test_shim); the wrapper only asks it for a
+    // fresh per-file state, keeping per-file parse+exec tiny.
+    Some(format!(
+        "{}{}\n__honeyTestBegin();\n{}{}",
+        TEST_SHIM_MARKER,
+        esm_marker,
+        prologue,
+        load
+    ))
 }
 
 /// Conservative ESM sniff: look for real `import`/`export` statements anywhere

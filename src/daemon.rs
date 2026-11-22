@@ -25,6 +25,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -69,6 +70,11 @@ pub struct Request {
     pub build_target: Option<String>,
     #[serde(default)]
     pub build_define: Vec<String>,
+    /// Test batches: the client leaves every preload empty and lets the
+    /// daemon build the shim wrappers (with this HONEY_SNAPSHOT_UPDATE
+    /// client flag), saving a double file-read per test on the client.
+    #[serde(default)]
+    pub snapshot_update: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -151,6 +157,31 @@ fn write_msg<S: std::io::Write + ?Sized>(stream: &mut S, value: &impl Serialize)
     Ok(())
 }
 
+/// Bound how long a socket read may block: the daemon's accept loop serves
+/// requests inline, so a client that connects and dies (SIGKILLed run,
+/// interrupted bench iteration) must not wedge the whole daemon on a
+/// half-open socket. Legit local clients send their full request frame
+/// within microseconds of connect; 2s is generous for even a jammed box.
+fn set_recv_timeout(stream: &std::os::unix::net::UnixStream, timeout: Duration) {
+    use std::os::unix::io::AsRawFd;
+    let tv = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    let r = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        trace_log("setsockopt SO_RCVTIMEO failed");
+    }
+}
+
 fn read_msg<S: std::io::Read + ?Sized>(stream: &mut S) -> Option<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf) {
@@ -170,39 +201,86 @@ fn read_msg<S: std::io::Read + ?Sized>(stream: &mut S) -> Option<Vec<u8>> {
 
 /// Entry point for `honey --internal-daemon`. Never returns while serving.
 pub fn serve() {
+    // A daemon crash used to be invisible (stderr nulled) and surfaced only
+    // as a mysterious ~1s client stall + respawn. Log panics to disk.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!(
+            "[{}] honey daemon panic: {info}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
+        if let Some(f) = daemon_stderr_log() {
+            if let Some(dir) = f.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&f)
+                .and_then(|mut fh| std::io::Write::write_all(&mut fh, msg.as_bytes()));
+        }
+        eprint!("{msg}");
+    }));
+
     let path = socket_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
 
-    let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Another daemon may already be live: ping it.
-            let already_live = UnixStream::connect(&path).ok().and_then(|mut s| {
-                // A jammed daemon must not wedge this process forever.
-                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-                let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
-                let ping = Request {
-                    cmd: "ping".into(),
-                    file: String::new(),
-                    args: vec![],
-                    cwd: String::new(),
-                    ..Default::default()
-                };
-                write_msg(&mut s, &ping).ok()?;
-                read_msg(&mut s)
-            });
-            if already_live.is_some() {
-                return; // daemon already running
+    // Single-instance arbitration by PID file, not by socket probing: the
+    // socket file lies (unlinked zombie listeners keep their path in
+    // /proc/net/unix, a dead listener leaves the file intact, and stealing
+    // the file mid-run made clients land on the wrong daemon). The pid file
+    // is the truth: a live pid wins, everything else is cleanable.
+    let pf = pid_file_path();
+    // Serialize the whole claim (pid check + socket rebind) behind an
+    // exclusive lock. Without it, N racing spawns each remove+bind the
+    // socket file and become N live daemons — old ones leak as zombie
+    // listeners clients can accidentally reach.
+    let lock_path = pf.with_extension("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path);
+    let _guard = match lock_file {
+        Ok(f) => {
+            let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+            if r != 0 { None } else { Some(f) } // keep the fd alive for the lock
+        }
+        Err(_) => None,
+    };
+    for _ in 0..50 {
+        match std::fs::read(&pf) {
+            Ok(b) if !b.is_empty() => {
+                let txt = String::from_utf8_lossy(&b);
+                match txt.trim().parse::<u32>() {
+                    Ok(pid) if pid != std::process::id() && daemon_pid_alive(pid) => {
+                        trace_log("serve: pid file shows a live daemon, exiting");
+                        return; // another daemon owns the ship
+                    }
+                    _ => break, // stale pid file: ours to clean up
+                }
             }
-            let _ = std::fs::remove_file(&path);
-            match UnixListener::bind(&path) {
-                Ok(l) => l,
-                Err(_) => return, // lost the race; the other daemon serves
+            _ => {
+                // No pid file (yet). Someone may be mid-bind; re-check briefly.
+                if !std::path::Path::new(&pf).exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
-        Err(_) => return,
+    }
+
+    // From here we are the only live daemon. Any socket file on the path is
+    // folklore — a stale file or an unlinked holdover — remove and rebind.
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => {
+            trace_log("serve: bound socket");
+            let _ = std::fs::write(&pf, std::process::id().to_string());
+            l
+        }
+        Err(_) => return, // lost a genuinely-concurrent bind; the winner serves
     };
 
     #[cfg(unix)]
@@ -210,10 +288,21 @@ pub fn serve() {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
+    // Claim complete: socket bound and pid file written. Release the startup
+    // lock — it must not be held for the daemon's lifetime or spawning
+    // clients would block forever behind it.
+    drop(_guard);
 
     // One warm engine for the whole daemon lifetime: first request builds
     // the V8 isolate, later runs reuse it (module cache included).
     let runtime = crate::runtime::Runtime::new_warm();
+    // A SECOND retained engine dedicated to test batches. `run` requests
+    // load an ESM main into their engine, which makes it un-reusable for
+    // the next preload run (deno_core: one main module per engine) — if
+    // tests shared that engine, every batch would pay a full engine
+    // rebuild on its first file. With a dedicated slot the test engine
+    // stays main-free (CJS-shaped preloads) and is reused forever.
+    let test_runtime = crate::runtime::Runtime::new_warm();
 
     // Prewarm the test-worker pool in the background so the first `honey
     // test` after a cold daemon start finds hot engines instead of paying
@@ -261,6 +350,11 @@ pub fn serve() {
     for stream in listener.incoming() {
         trace_log("accepted connection");
         let Ok(mut stream) = stream else { continue };
+        // A client that connects and dies must not wedge the accept loop on
+        // a half-open read. Bound is PER-READ: requests queued in the
+        // listener backlog are unaffected (the timer starts when this loop
+        // actually reads them), and legit clients fill the frame in µs.
+        set_recv_timeout(&stream, Duration::from_millis(250));
         let request = match read_msg(&mut stream) {
             Some(bytes) if bytes.is_empty() => continue,
             Some(bytes) => match serde_json::from_slice::<Request>(&bytes) {
@@ -291,6 +385,7 @@ pub fn serve() {
                     error: None,
                     file: None,
                 });
+                trace_log("serve: stop requested, exiting");
                 break;
             }
             "build" | "build_watch" => {
@@ -334,7 +429,7 @@ pub fn serve() {
                 // file (pristine per-file globals); small batches stay in
                 // the single warm engine.
                 let req = request.clone();
-                let out_body = serve_test_batch(req, &runtime);
+                let out_body = serve_test_batch(req, &test_runtime);
                 let _ = write_msg(&mut stream, &out_body);
             }
             "run" if !request.preload.is_empty() => {
@@ -405,7 +500,17 @@ pub fn serve() {
     if let Ok(mut pool) = TEST_POOL.lock() {
         pool.clear(); // Drop: kill + wait each worker
     }
+    trace_log("serve: accept loop ended (clean exit)");
     let _ = std::fs::remove_file(&path);
+    // Clear our pid file only if it still names us (never clobber a
+    // successor's).
+    if std::fs::read_to_string(pid_file_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        == Some(std::process::id())
+    {
+        let _ = std::fs::remove_file(pid_file_path());
+    }
 }
 
 /// Rebuild the client's BuildOptions from the wire fields of a build or
@@ -650,7 +755,24 @@ fn build_watch_session(stream: &mut UnixStream, request: &Request) {
 
 /// Serve one test_batch request. Chooses between the sequential warm-engine
 /// path and chunked-parallel worker subprocesses (see the dispatch comment).
-fn serve_test_batch(req: Request, runtime: &crate::runtime::Runtime) -> TestBatchResponse {
+fn serve_test_batch(mut req: Request, runtime: &crate::runtime::Runtime) -> TestBatchResponse {
+    // Daemon-side wrapper building: empty preloads mean the client skipped
+    // the per-file read (the daemon already reads every file to run it).
+    // ESM sniff + shim marker come along from lib::runtime.
+    if req.args.iter().enumerate().any(|(i, f)| !f.is_empty() && req.preloads.get(i).map(String::is_empty).unwrap_or(true)) {
+        let mut preloads: Vec<String> = req.preloads.clone();
+        for (i, f) in req.args.iter().enumerate() {
+            if f.is_empty() {
+                continue;
+            }
+            let empty = req.preloads.get(i).map(String::is_empty).unwrap_or(true);
+            if empty {
+                preloads.resize(req.args.len(), String::new());
+                preloads[i] = crate::runtime::test_preload_for_snapshot(std::path::Path::new(f), req.snapshot_update).unwrap_or_default();
+            }
+        }
+        req.preloads = preloads;
+    }
     let n = req.args.len();
     let sequential = std::env::var("HONEY_TEST_SEQUENTIAL").as_deref() == Ok("1");
     let force_workers = std::env::var("HONEY_TEST_WORKERS")
@@ -674,7 +796,13 @@ fn serve_test_batch(req: Request, runtime: &crate::runtime::Runtime) -> TestBatc
         chunk_count = c.min(n.max(1));
     }
 
-    if sequential || force_workers || n < 8 || chunk_count <= 1 {
+    // Parallel workers only pay off for LARGE suites: the pool round-trip,
+    // per-chunk engine init and cross-process contention cost ~8-11ms of
+    // wall each chunk round, while the daemon's retained test engine runs
+    // a warm file in ~80µs. Benchmarked crossover on the 50-file suite:
+    // sequential ~4-7ms vs parallel 11-18ms. Stay in-daemon until the
+    // suite is far beyond what one engine eats quickly.
+    if sequential || force_workers || n <= 100 || chunk_count <= 1 {
         return serve_test_batch_sequential(req, runtime);
     }
     serve_test_batch_parallel(req, chunk_count)
@@ -684,8 +812,10 @@ fn serve_test_batch(req: Request, runtime: &crate::runtime::Runtime) -> TestBatc
 /// evicting the module first so unchanged files still re-execute.
 fn serve_test_batch_sequential(req: Request, runtime: &crate::runtime::Runtime) -> TestBatchResponse {
     let rt = runtime;
+    let t_start = std::time::Instant::now();
     let mut results = Vec::with_capacity(req.args.len());
     for (i, file) in req.args.iter().enumerate() {
+        let t_file = std::time::Instant::now();
         let preload = req.preloads.get(i).cloned().unwrap_or_default();
         crate::runtime::evict_module(file);
         let run_req = Request {
@@ -699,8 +829,21 @@ fn serve_test_batch_sequential(req: Request, runtime: &crate::runtime::Runtime) 
         response.stdout = out;
         response.stderr = err;
         response.file = Some(file.clone());
+        let us = t_file.elapsed().as_micros();
+        if us > 2000 {
+            trace_log(&format!(
+                "test seq: file {i}/{} slow {us}us {}",
+                req.args.len(),
+                file.rsplit('/').next().unwrap_or(file)
+            ));
+        }
         results.push(response);
     }
+    trace_log(&format!(
+        "test seq done: n={} total_us={}",
+        req.args.len(),
+        t_start.elapsed().as_micros()
+    ));
     TestBatchResponse { results }
 }
 
@@ -1720,6 +1863,43 @@ fn connect() -> Option<UnixStream> {
     UnixStream::connect(socket_path()).ok()
 }
 
+/// Path of the daemon pid file: the single source of truth for "is there a
+/// live daemon", because the socket file lags (dead listeners leave it) and
+/// /proc/net/unix lies (unlinked zombies keep the path).
+fn pid_file_path() -> PathBuf {
+    socket_path().with_extension("pid")
+}
+
+/// Is `pid` a live honey-full daemon? kill(pid,0) says alive-but-maybe-other
+/// program, so also confirm the cmdline.
+fn daemon_pid_alive(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .map(|c| c.contains("honey-full") && c.contains("internal-daemon"))
+        .unwrap_or(false)
+}
+
+/// Is a daemon currently running, per the pid file?
+fn daemon_process_alive() -> bool {
+    let pf = pid_file_path();
+    std::fs::read_to_string(&pf)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(daemon_pid_alive)
+        .unwrap_or(false)
+}
+
+/// Where spawned-daemon crash output goes (last ~64KB kept useful by size cap
+/// at open time not enforced — one line per crash, realistically tiny).
+fn daemon_stderr_log() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .map(|d| d.join("honey").join("daemon-crash.log"))
+}
+
 fn spawn_daemon() -> Result<()> {
     // First run: install + `enable --now` the daemon service (systemd user
     // unit on Linux, launchd agent on macOS), silently and once per binary.
@@ -1737,15 +1917,61 @@ fn spawn_daemon() -> Result<()> {
         }
         return Ok(()); // service start may still be initializing; don't race it
     }
-    if connect().is_some() {
+    if daemon_process_alive() || connect().is_some() {
         return Ok(());
     }
+    // Serialize with other spawning clients: under the same lock the daemon
+    // claims the socket, re-check the pid file. A burst of concurrent clients
+    // must produce ONE spawn, not one per thread.
+    let lock_path = pid_file_path().with_extension("lock");
+    if let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            if let Ok(txt) = std::fs::read_to_string(pid_file_path()) {
+                if let Ok(pid) = txt.trim().parse::<u32>() {
+                    if daemon_pid_alive(pid) {
+                        return Ok(()); // someone won the race already
+                    }
+                }
+            }
+            // Hold the lock while fork+exec starts: the child re-acquires it
+            // itself in serve(), so drop only after the process exists.
+            let spawned = (|| -> Result<()> {
+                trace_log("client: spawning daemon (connect failed, lock held)");
+                spawn_daemon_locked()
+            })();
+            drop(lock);
+            return spawned;
+        }
+    }
+    spawn_daemon_locked()
+}
+
+fn spawn_daemon_locked() -> Result<()> {
     let exe = std::env::current_exe().context("failed to locate honey executable")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--internal-daemon")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
+    // Keep stderr: a daemon that dies (V8 CHECK abort, Rust panic) must leave
+    // its last words somewhere readable, or a crash shows up only as a ~1s
+    // stall and a respawn. Cost: one O_APPEND fd per daemon lifetime.
+    if let Some(f) = daemon_stderr_log() {
+        match std::fs::OpenOptions::new().create(true).append(true).open(&f) {
+            Ok(file) => {
+                cmd.stderr(std::process::Stdio::from(file));
+            }
+            Err(_) => {
+                cmd.stderr(std::process::Stdio::null());
+            }
+        }
+    } else {
+        cmd.stderr(std::process::Stdio::null());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1782,6 +2008,13 @@ fn request_raw(req: &Request, mut stream: UnixStream) -> Option<Vec<u8>> {
 
 fn request(req: &Request, stream: UnixStream) -> Option<Response> {
     serde_json::from_slice(&request_raw(req, stream)?).ok()
+}
+
+/// Write a request and read one reply frame. Callers that already bounded
+/// the connect phase use this for the exchange itself.
+fn request_raw_after_connect(req: &Request, stream: &mut UnixStream) -> Option<Vec<u8>> {
+    write_msg(stream, req).ok()?;
+    read_msg(stream)
 }
 
 /// `honey run --watch`: open a watch session with the daemon and stream each
@@ -1834,7 +2067,10 @@ fn wait_for_socket(timeout: Duration) -> Option<UnixStream> {
         if let Some(stream) = connect() {
             return Some(stream);
         }
-        if !spawned {
+        // Only spawn when the pid file says nobody's home. If a daemon is
+        // alive, the socket must be mid-dance (crash cleanup, restart) —
+        // poll, don't pile on spawns.
+        if !spawned && !daemon_process_alive() {
             spawned = true;
             let _ = spawn_daemon();
         }
@@ -2018,6 +2254,17 @@ pub fn build_watch_via_daemon(
 /// unavailable/disabled or speaks an older protocol (caller falls back to the
 /// worker-subprocess path).
 pub fn test_batch_via_daemon(jobs: &[(String, String)]) -> Option<Vec<Response>> {
+    test_batch_via_daemon_with_snapshot(jobs, snapshot_update_enabled_on_client())
+}
+
+/// Client env snapshot-update flag, read here so every caller is consistent.
+fn snapshot_update_enabled_on_client() -> bool {
+    matches!(std::env::var("HONEY_SNAPSHOT_UPDATE").as_deref(), Ok("1"))
+}
+
+/// Same as test_batch_via_daemon, but overrides the snapshot-update flag the
+/// daemon uses when it builds the shim wrappers (preloads stay empty).
+pub fn test_batch_via_daemon_with_snapshot(jobs: &[(String, String)], snapshot_update: bool) -> Option<Vec<Response>> {
     if jobs.is_empty() {
         return None;
     }
@@ -2035,10 +2282,19 @@ pub fn test_batch_via_daemon(jobs: &[(String, String)]) -> Option<Vec<Response>>
         args: jobs.iter().map(|(f, _)| f.clone()).collect(),
         cwd,
         preloads: jobs.iter().map(|(_, p)| p.clone()).collect(),
+        snapshot_update,
         ..Default::default()
     };
-    let stream = connect().or_else(|| wait_for_socket(Duration::from_millis(500)))?;
-    let body = request_raw(&req, stream)?;
+    let mut stream = connect().or_else(|| wait_for_socket(Duration::from_millis(500)))?;
+    let body = {
+        // A wedged engine used to hang the client forever; a deadline turned
+        // that into a fallback storm instead (the daemon serves requests
+        // serially, so queued asks can legitimately wait >2s under load).
+        // Keep the bounded wait only on the CONNECT phase above; the
+        // response wait is unbounded here, and daemon-side dead-client
+        // reads are bounded by SO_RCVTIMEO instead.
+        request_raw_after_connect(&req, &mut stream)?
+    };
     let resp: TestBatchResponse = serde_json::from_slice(&body).ok()?;
     if resp.results.len() == jobs.len() {
         Some(resp.results)
@@ -2167,8 +2423,17 @@ pub fn start_daemon() -> Result<(u32, bool)> {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--internal-daemon")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
+    match daemon_stderr_log()
+        .and_then(|f| std::fs::OpenOptions::new().create(true).append(true).open(&f).ok())
+    {
+        Some(file) => {
+            cmd.stderr(std::process::Stdio::from(file));
+        }
+        None => {
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

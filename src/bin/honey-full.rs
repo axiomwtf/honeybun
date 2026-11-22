@@ -257,42 +257,13 @@ fn snapshot_update_enabled() -> bool {
 
 /// Nearest package.json "type": "module" (mirrors the runtime's check).
 fn nearest_package_json_is_module(from: &std::path::Path) -> bool {
-    let mut dir = from.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    loop {
-        let pkg = dir.join("package.json");
-        if pkg.exists() {
-            if let Ok(content) = std::fs::read_to_string(&pkg) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    return json
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .map(|t| t == "module")
-                        .unwrap_or(false);
-                }
-            }
-            return false;
-        }
-        if !dir.pop() {
-            return false;
-        }
-    }
+    honey::runtime::nearest_package_json_is_module(from)
 }
 
 /// The ESM/CJS flavor the engine will use for a main module (mirrors the
 /// runtime's decision: .mjs/.mts, nearest package.json "type", source sniff).
 fn main_module_is_esm(path: &std::path::Path) -> bool {
-    if let Some(ext) = path.extension() {
-        if ext == "mjs" || ext == "mts" {
-            return true;
-        }
-    }
-    if nearest_package_json_is_module(path) {
-        return true;
-    }
-    match std::fs::read_to_string(path) {
-        Ok(source) => looks_like_esm_source(&source),
-        Err(_) => false,
-    }
+    honey::runtime::main_module_is_esm(path)
 }
 
 /// The JS wrapper loaded instead of a test file: it installs the shim, then
@@ -300,29 +271,7 @@ fn main_module_is_esm(path: &std::path::Path) -> bool {
 /// load is `require(...)` (CJS wrapper) or `await import(...)` (ESM wrapper,
 /// `export {}` marks it ESM for the engine's sniff).
 fn test_preload_for(path: &std::path::Path) -> Option<String> {
-    let path_str = path.to_string_lossy().into_owned();
-    let esm = main_module_is_esm(path);
-    let prologue = format!(
-        "globalThis.__HONEY_TEST_FILE = {};\nglobalThis.__HONEY_SNAPSHOT_UPDATE = {};\n",
-        serde_json::to_string(&path_str).ok()?,
-        snapshot_update_enabled()
-    );
-    let load = if esm {
-        format!("await import({});\n", serde_json::to_string(&path_str).ok()?)
-    } else {
-        format!("require({});\n", serde_json::to_string(&path_str).ok()?)
-    };
-    let esm_marker = if esm { "export {};\n" } else { "" };
-    // V2: the shim itself is registered once per engine (see runtime.rs's
-    // TEST_SHIM / execute_pending_test_shim); the wrapper only asks it for a
-    // fresh per-file state, keeping per-file parse+exec tiny.
-    Some(format!(
-        "{}{}\n__honeyTestBegin();\n{}{}",
-        honey::runtime::TEST_SHIM_MARKER,
-        esm_marker,
-        prologue,
-        load
-    ))
+    honey::runtime::test_preload_for(path)
 }
 
 /// One test file run through the daemon's preload path (worker subprocess on
@@ -599,8 +548,16 @@ fn run_test_batch(jobs: &[(String, String)]) -> (usize, usize) {
     let force_workers = std::env::var("HONEY_TEST_WORKERS")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
+    // Warm daemon path: send only the file list; the daemon builds the shim
+    // wrappers itself (it reads the files anyway). Local non-daemon paths
+    // (sequential/parallel workers below) need real wrappers, so those keep
+    // building them client-side.
     if !force_workers {
-        if let Some(results) = daemon::test_batch_via_daemon(jobs) {
+        let bare: Vec<(String, String)> = jobs
+            .iter()
+            .map(|(f, _)| (f.clone(), String::new()))
+            .collect();
+        if let Some(results) = daemon::test_batch_via_daemon_with_snapshot(&bare, snapshot_update_enabled()) {
             let cwd = std::env::current_dir().unwrap_or_default();
             let mut passed = 0usize;
             let mut failed = 0usize;
