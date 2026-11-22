@@ -1,216 +1,202 @@
-use anyhow::{Context, Result};
-use clap::Parser;
-use honey::runtime::Runtime;
-use honey::PackageManager;
-use serde_json;
-use std::fs;
-use std::path::Path;
+//! `hxney` — one-off package executor (npx/bunx equivalent), thin launcher.
+//!
+//! Package resolution is plain filesystem work (scan .cinm, read
+//! package.json, pick bin/main); executing is daemon work. The launcher
+//! does the fs part itself (~0.2ms), warm-runs the resolved entry through
+//! the daemon like `honey run`, and execv's into `hxney-full` for
+//! anything unusual: packages that need installing from npm, scoped
+//! names (`@scope/pkg`), subpath entries (`pkg/bin`), trace/dev modes —
+//! those keep the full-fat path with identical behaviour.
 
-#[derive(Parser)]
-#[command(name = "hxney")]
-#[command(author = "AXIOM")]
-#[command(version = "0.1.0")]
-#[command(about = "One-off package executor (npx/bunx equivalent)", long_about = None)]
-struct Cli {
-    /// Package to execute
-    package: String,
-    /// Arguments to pass to the package
-    #[arg(trailing_var_arg = true)]
-    args: Vec<String>,
+use serde::{Deserialize, Serialize};
+use std::os::unix::net::UnixStream;
+
+#[derive(Serialize)]
+struct RunRequest<'a> {
+    cmd: &'a str,
+    file: &'a str,
+    args: &'a [String],
+    cwd: String,
+}
+
+#[derive(Deserialize)]
+struct RunResponse {
+    exit_code: i32,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn socket_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("HONEY_SOCKET") {
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
+        if !d.is_empty() {
+            return std::path::PathBuf::from(d).join("honey.sock");
+        }
+    }
+    let uid = unsafe { libc::getuid() };
+    std::path::PathBuf::from(format!("/tmp/honey-{uid}.sock"))
+}
+
+/// execv into the full-fat CLI/engine binary. Never returns on success.
+fn exec_full() -> ! {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let full = exe.with_file_name("hxney-full");
+    use std::os::unix::process::CommandExt as _;
+    let err = std::process::Command::new(&full)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    eprintln!(
+        "error: hxney launcher could not exec {} ({err}); is hxney-full installed next to it?",
+        full.display()
+    );
+    std::process::exit(127);
+}
+
+/// Scan `.cinm` for the newest `name@*` dir and resolve its bin/main entry.
+/// Returns None whenever anything is off the fast path.
+fn resolve_entry(package: &str) -> Option<std::path::PathBuf> {
+    // Only plain, unscoped package names take the fast path.
+    if package.is_empty() || package.contains('@') || package.contains('/') {
+        return None;
+    }
+    let root = std::path::Path::new(".cinm");
+    let mut found: Option<std::path::PathBuf> = None;
+    let prefix = format!("{package}@");
+    for entry in fs_read_dir(root)? {
+        let name = entry.file_name()?.to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && found.is_none() {
+            found = Some(entry.as_path().to_owned());
+        }
+    }
+    let pkg_dir = found?;
+    let pkg_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(pkg_dir.join("package.json")).ok()?,
+    )
+    .ok()?;
+
+    let bin_path = match pkg_json.get("bin") {
+        Some(serde_json::Value::Object(m)) => m.values().next().and_then(|v| v.as_str()),
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    let entry = match bin_path {
+        Some(rel) => pkg_dir.join(rel),
+        None => match pkg_json.get("main").and_then(|v| v.as_str()) {
+            Some(rel) => pkg_dir.join(rel),
+            None => pkg_dir.join("index.js"),
+        },
+    };
+    let entry = entry.canonicalize().unwrap_or(entry);
+    if entry.is_file() {
+        Some(entry)
+    } else {
+        None
+    }
+}
+
+/// Minimal read_dir iterator that yields entries (or None on any error).
+fn fs_read_dir(
+    path: &std::path::Path,
+) -> Option<impl Iterator<Item = std::path::PathBuf>> {
+    let rd = std::fs::read_dir(path).ok()?;
+    Some(rd.filter_map(|e| e.ok()).map(|e| e.path()))
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut argv: Vec<String> = std::env::args().collect();
 
-    if let Err(e) = execute_package(&cli.package, &cli.args) {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    }
-}
-
-fn execute_package(package: &str, args: &[String]) -> Result<()> {
-    let pm = PackageManager::new(Path::new("."));
-
-    // Parse package@version or package
-    let (name, _version) = if package.contains('@') {
-        let parts: Vec<&str> = package.splitn(2, '@').collect();
-        (parts[0], Some(parts.get(1).cloned().unwrap_or("latest")))
-    } else {
-        (package, None)
-    };
-
-    // Check if package is already installed by scanning .cinm
-    let entries = if pm.layout.root.exists() {
-        fs::read_dir(&pm.layout.root)
-            .with_context(|| format!("failed to read .cinm directory"))?
-    } else {
-        // .cinm doesn't exist yet
-        fs::create_dir_all(&pm.layout.root).context("failed to create .cinm directory")?;
-        fs::read_dir(&pm.layout.root)
-            .with_context(|| format!("failed to read .cinm directory"))?
-    };
-
-    let mut found_dir: Option<std::path::PathBuf> = None;
-    let cwd = std::env::current_dir()?;
-    for entry in entries {
-        let entry = entry?;
-        let entry_name = entry.file_name().to_string_lossy().to_string();
-        if entry_name.starts_with(&format!("{}@", name)) {
-            // Convert to absolute path
-            let abs_path = if entry.path().is_absolute() {
-                entry.path()
-            } else {
-                cwd.join(entry.path())
-            };
-            found_dir = Some(abs_path);
-            break;
-        }
+    if argv.len() == 2 && (argv[1] == "--version" || argv[1] == "-V") {
+        println!("hxney {}", env!("CARGO_PKG_VERSION"));
+        return;
     }
 
-    let pkg_dir = if let Some(dir) = found_dir {
-        dir.canonicalize().unwrap_or(dir)
-    } else {
-        // Need to install from npm
-        // For now, try to install the package
-        match pm.add(package, false) {
-            Ok(_) => {
-                // Now find it again
-                let cwd = std::env::current_dir()?;
-                let entries = fs::read_dir(&pm.layout.root)
-                    .with_context(|| format!("failed to read .cinm directory"))?;
-                let mut new_found_dir: Option<std::path::PathBuf> = None;
-                for entry in entries {
-                    let entry = entry?;
-                    let entry_name = entry.file_name().to_string_lossy().to_string();
-                    if entry_name.starts_with(&format!("{}@", name)) {
-                        let abs_path = if entry.path().is_absolute() {
-                            entry.path()
-                        } else {
-                            cwd.join(entry.path())
-                        };
-                        let canonical_path = abs_path.canonicalize().unwrap_or(abs_path);
-                        new_found_dir = Some(canonical_path);
-                        break;
-                    }
-                }
-                new_found_dir.ok_or_else(|| anyhow::anyhow!("package {} not found in .cinm after install", name))?
-            }
-            Err(_) => {
-                // If install fails, try to use the package as a local path
-                // This allows testing with locally set up .cinm
-                anyhow::bail!("failed to install package {}. Please run 'honey add {}' first or ensure it's in .cinm", package, package);
-            }
-        }
+    // Dev/trace modes and odd invocations keep the full-fat semantics.
+    if std::env::var_os("HONEY_TRACE").is_some() || std::env::var_os("HONEY_NO_DAEMON").is_some()
+        || argv.len() < 2
+    {
+        exec_full();
+    }
+    let package = argv[1].clone();
+    let args: Vec<String> = argv[2..].to_vec();
+
+    // Node semantics: argv[0] executable, argv[1] entry path, argv[2..] args.
+    // The daemon's run path builds exactly this shape (honey, file, args).
+    let Some(entry) = resolve_entry(&package) else {
+        exec_full(); // needs install, is scoped, or has no resolvable entry
     };
+    let entry_str = entry.to_string_lossy().into_owned();
+    let pkg_cwd = entry.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
-    // Read package.json to find bin entry
-    let package_json_path = pkg_dir.join("package.json");
-    let bin_name = if package.contains('/') {
-        // Scoped package or subpath like "package/bin"
-        let parts: Vec<&str> = package.split('/').collect();
-        if parts.len() > 1 {
-            parts[1].to_string()
-        } else {
-            name.to_string()
-        }
-    } else {
-        name.to_string()
-    };
+    let stream = UnixStream::connect(socket_path());
+    if stream.is_err() {
+        exec_full(); // daemon down: full binary auto-starts it
+    }
+    let mut stream = stream.unwrap();
 
-    let bin_path = if package_json_path.exists() {
-        if let Ok(package_json_str) = fs::read_to_string(&package_json_path) {
-            if let Ok(package_json) = serde_json::from_str::<serde_json::Value>(&package_json_str) {
-                if let Some(bin_obj) = package_json.get("bin").and_then(|v| v.as_object()) {
-                    // bin is an object mapping command names to paths
-                    if let Some(bin_entry) = bin_obj.get(&bin_name) {
-                        Some(pkg_dir.join(bin_entry.as_str().unwrap_or("index.js")))
-                    } else if let Some(bin_entry) = bin_obj.get(name) {
-                        Some(pkg_dir.join(bin_entry.as_str().unwrap_or("index.js")))
-                    } else {
-                        // Try first key
-                        bin_obj.keys().next().map(|k| pkg_dir.join(bin_obj.get(k).unwrap().as_str().unwrap_or("index.js")))
-                    }
-                } else if let Some(bin_str) = package_json.get("bin").and_then(|v| v.as_str()) {
-                    // bin is a string
-                    Some(pkg_dir.join(bin_str))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let req = RunRequest { cmd: "run", file: &entry_str, args: &args, cwd: pkg_cwd };
+    let mut body = serde_json::to_vec(&req).unwrap_or_default();
+    let mut msg = Vec::with_capacity(4 + body.len());
+    msg.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    msg.append(&mut body);
 
-    // Fallback to main or index.js
-    let entry_path = bin_path.unwrap_or_else(|| {
-        let main_path = if package_json_path.exists() {
-            if let Ok(package_json_str) = fs::read_to_string(&package_json_path) {
-                if let Ok(package_json) = serde_json::from_str::<serde_json::Value>(&package_json_str) {
-                    package_json.get("main").and_then(|v| v.as_str()).map(|m| pkg_dir.join(m)).unwrap_or(pkg_dir.join("index.js"))
-                } else {
-                    pkg_dir.join("index.js")
-                }
-            } else {
-                pkg_dir.join("index.js")
-            }
-        } else {
-            pkg_dir.join("index.js")
-        };
-        main_path
-    });
-
-    // Check if the entry point exists
-    if !entry_path.exists() {
-        anyhow::bail!("entry point not found: {}", entry_path.display());
+    use std::io::{Read, Write};
+    if stream.write_all(&msg).is_err() {
+        exec_full();
     }
 
-    // Save current directory
-    let original_dir = std::env::current_dir()?;
-
-    // Change to the package directory context
-    std::env::set_current_dir(&pkg_dir)?;
-
-    // Create a wrapper script that sets process.argv and requires the entry point
-    // Node semantics: argv[0] = executable, argv[1] = script path, argv[2..] = args
-    let escaped_entry = entry_path.display().to_string().replace('\\', "\\\\").replace('\'', "\\'");
-    let args_json: Vec<String> = args
-        .iter()
-        .map(|a| format!("'{}'", a.replace('\\', "\\\\").replace('\'', "\\'")))
-        .collect();
-    let wrapper_content = format!(
-        "process.argv = ['honey', '{}', {}];\nrequire('{}');\n",
-        escaped_entry,
-        args_json.join(", "),
-        escaped_entry
-    );
-    
-    // Write wrapper to a temp file OUTSIDE the project: Axiom policy counts
-    // companion files as bugs, so nothing transient is left in the package dir.
-    let wrapper_path = std::env::temp_dir().join(format!("hxney-wrapper-{}.js", std::process::id()));
-    fs::write(&wrapper_path, &wrapper_content).context("failed to write wrapper")?;
-
-    // Execute the wrapper
-    let runtime = Runtime::new();
-    let result = runtime.run_file(wrapper_path.to_str().unwrap_or(""), &[]);
-
-    // Clean up wrapper
-    let _ = fs::remove_file(&wrapper_path);
-
-    // Restore original directory
-    std::env::set_current_dir(&original_dir)?;
-
-    match result {
-        Ok(code) => {
-            if code != 0 {
-                std::process::exit(code);
+    // Spin briefly before blocking; warm requests answer sub-millisecond.
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(500);
+        loop {
+            let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if r != 0 {
+                break;
             }
-            Ok(())
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::hint::spin_loop();
         }
-        Err(e) => Err(e),
+    }
+
+    fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).ok()?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len > 256 * 1024 * 1024 {
+            return None;
+        }
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).ok()?;
+        Some(body)
+    }
+
+    match read_frame(&mut stream).and_then(|b| serde_json::from_slice::<RunResponse>(&b).ok()) {
+        Some(resp) => {
+            use std::io::Write as _;
+            let stdout = std::io::stdout();
+            {
+                let mut lock = stdout.lock();
+                let _ = lock.write_all(resp.stdout.as_bytes());
+                let _ = lock.flush();
+            }
+            eprint!("{}", resp.stderr);
+            if let Some(err) = &resp.error {
+                eprintln!("error: {err}");
+            }
+            std::process::exit(resp.exit_code);
+        }
+        None => exec_full(),
     }
 }

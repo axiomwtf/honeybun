@@ -14,10 +14,6 @@ thread_local! {
     static ARGS: RefCell<Vec<String>> = RefCell::new(Vec::new());
     static EXIT_REQUEST: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static UNCAUGHT_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// Set while a warm engine has registered an ESM main module with
-    /// deno_core; such an engine can never load another main module, so the
-    /// next warm run must rebuild from scratch.
-    static WARM_ENGINE_HAS_MAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Monotonic counter for synthetic inline-preload script/module names (one
@@ -69,17 +65,22 @@ pub struct Runtime {
     /// never populates it; the engine is created and dropped per run.
     warm: std::cell::Cell<Option<JsRuntime>>,
     keep_alive: bool,
+    /// True once THIS engine registered an ESM main module with deno_core;
+    /// such an engine can never load another main module. Must live on the
+    /// Runtime (not a thread-local): the daemon hands the warm engine from
+    /// thread to thread, so the flag has to travel with it.
+    engine_has_main: std::cell::Cell<bool>,
 }
 
 impl Runtime {
     pub fn new() -> Self {
-        Runtime { warm: std::cell::Cell::new(None), keep_alive: false }
+        Runtime { warm: std::cell::Cell::new(None), keep_alive: false, engine_has_main: std::cell::Cell::new(false) }
     }
 
     /// Warm mode: a successful run hands the engine back for the next run,
     /// skipping V8 isolate creation, snapshot decode and global setup.
     pub fn new_warm() -> Self {
-        Runtime { warm: std::cell::Cell::new(None), keep_alive: true }
+        Runtime { warm: std::cell::Cell::new(None), keep_alive: true, engine_has_main: std::cell::Cell::new(false) }
     }
 
     /// Run a JS/TS file, returning its exit code (1 on a host-level error).
@@ -104,7 +105,11 @@ impl Runtime {
         });
 
         let (runtime, result) = match self.warm.take() {
-            Some(rt) if !WARM_ENGINE_HAS_MAIN.with(|f| f.get()) => {
+            Some(rt) => {
+                // Keep the warm engine for BOTH CJS and ESM mains: CJS goes
+                // through warm_prepare + the CJS machinery; a second ESM main
+                // evaluates as a side module (see execute_script). Only a
+                // genuinely cold start builds a fresh engine here.
                 let mut rt = rt;
                 {
                     let cwd = std::env::current_dir()
@@ -116,11 +121,9 @@ impl Runtime {
                 }
                 self.execute_script(name, _args, rt)
             }
-            warm_or_none => {
-                // Cold start, or the previous engine served an ESM main
-                // module (deno_core refuses a second main per engine).
-                drop(warm_or_none);
-                WARM_ENGINE_HAS_MAIN.with(|f| f.set(false));
+            None => {
+                // Truly cold.
+                self.engine_has_main.set(false);
                 let rt = build_runtime();
                 self.execute_script(name, _args, rt)
             }
@@ -161,7 +164,7 @@ impl Runtime {
         let is_esm_wrapper = preload.contains("export {};");
 
         let (runtime, result) = match self.warm.take() {
-            Some(rt) if !WARM_ENGINE_HAS_MAIN.with(|f| f.get()) => {
+            Some(rt) if !self.engine_has_main.get() => {
                 let mut rt = rt;
                 warm_prepare(&mut rt, &full_path);
                 self.execute_preload(main_file, preload, is_esm_wrapper, rt)
@@ -212,7 +215,7 @@ impl Runtime {
                 Ok(s) => s,
                 Err(e) => return (runtime, Err(anyhow::anyhow!("bad preload specifier: {e}"))),
             };
-            WARM_ENGINE_HAS_MAIN.with(|f| f.set(true));
+            self.engine_has_main.set(true);
             (|| -> anyhow::Result<()> {
                 let id = block_on(runtime.load_main_es_module_from_code(&specifier, preload.to_owned()))
                     .map_err(|e| anyhow::anyhow!("failed to load test wrapper: {e}"))?;
@@ -368,34 +371,112 @@ impl Runtime {
         phase_trace("esm_detect", t_detect.elapsed());
 
         if esm {
-            // Loading a second main module into this engine is impossible for
-            // deno_core; mark the engine so the next warm run rebuilds.
-            WARM_ENGINE_HAS_MAIN.with(|f| f.set(true));
-            // Use load_main_es_module_from_code to avoid double loading
-            let t_eval = std::time::Instant::now();
-            let id = match block_on(runtime.load_main_es_module_from_code(&module_specifier, source)) {
-                Ok(id) => id,
-                Err(e) => return (runtime, Err(e).context("failed to load module")),
-            };
-
-            // Evaluate the module - run mod_evaluate and event loop like deno_core tests
-            let _ = runtime.mod_evaluate(id);
-            match block_on(runtime.run_event_loop(Default::default())) {
-                Ok(()) => {}
-                Err(e) => {
-                    let msg = format!("{}", e);
-                    if msg.contains("__honey_exit__") {
-                        if let Some(code) = take_exit_request() {
-                            use std::io::Write as _;
-                            let _ = std::io::stdout().flush();
-                            let _ = std::io::stderr().flush();
-                            return (runtime, Ok(code));
+            // Warm-engine ESM replays: deno_core refuses a second *main*
+            // module per engine, but a TLA-free side module can be compiled,
+            // instantiated and evaluated into the same warm isolate as many
+            // times as we like via `lazy_load_es_module_with_code` (JIT
+            // state, snapshot context, builtin caches intact). The URL gets
+            // a per-run query so re-running the same path re-executes
+            // instead of dedup-hitting the module map; HoneyModuleLoader
+            // strips the query before disk IO. Real `main` semantics (first
+            // run, and full cold runs) are unchanged.
+            let had_main = self.engine_has_main.get();
+            if phase_trace_enabled() {
+                phase_trace(&format!("esm_replay had_main={had_main}"), std::time::Duration::ZERO);
+            }
+            let mut esm_warm_done = false;
+            if had_main {
+                static SIDE_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                let seq = SIDE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let unique = format!("{}?honeyrun={}", module_specifier.as_str(), seq);
+                let t_eval = std::time::Instant::now();
+                // lazy_load_es_module_with_code registers (with a fresh
+                // specifier), compiles, instantiates, evaluates and drains
+                // microtasks — all synchronously, with no main-module
+                // bookkeeping in the way. It panics on TLA sources and/
+                // or errors when the module's imports aren't already in
+                // the module map (a different main ran in this engine
+                // since their last main load), so the attempt is wrapped:
+                // ANY failure falls back to a fresh cold engine and the
+                // ordinary main path below.
+                let lazy_rc = {
+                    let prev_hook = std::panic::take_hook();
+                    std::panic::set_hook(Box::new(|_| {}));
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime
+                            .lazy_load_es_module_with_code(unique, source.clone())
+                    }));
+                    std::panic::set_hook(prev_hook);
+                    r
+                };
+                match lazy_rc {
+                    Ok(Ok(_ns)) => {}
+                    _ => {
+                        // Engine spent: discard it entirely and rebuild.
+                        // esm_warm_done stays false, so the ordinary main
+                        // path below runs on the fresh engine.
+                        let t_re = std::time::Instant::now();
+                        let fresh = build_runtime();
+                        self.engine_has_main.set(false);
+                        runtime = fresh;
+                        if phase_trace_enabled() {
+                            phase_trace("esm_replay_fallback_rebuild", t_re.elapsed());
                         }
                     }
-                    return (runtime, Err(e).context("event loop failed"));
+                }
+                // Pump the event loop for timers/promises the module left
+                // behind (lazy_load only drains microtasks).
+                match block_on(runtime.run_event_loop(Default::default())) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let msg = format!("{}", e);
+                        if msg.contains("__honey_exit__") {
+                            if let Some(code) = take_exit_request() {
+                                use std::io::Write as _;
+                                let _ = std::io::stdout().flush();
+                                let _ = std::io::stderr().flush();
+                                return (runtime, Ok(code));
+                            }
+                        }
+                        return (runtime, Err(e).context("event loop failed"));
+                    }
+                }
+                if phase_trace_enabled() {
+                    phase_trace("esm_eval+loop", t_eval.elapsed());
+                }
+                esm_warm_done = true;
+            }
+            if !esm_warm_done {
+                // Use load_main_es_module_from_code to avoid double loading
+                self.engine_has_main.set(true);
+                let t_eval = std::time::Instant::now();
+                let id = match block_on(runtime.load_main_es_module_from_code(&module_specifier, source)) {
+                    Ok(id) => id,
+                    Err(e) => return (runtime, Err(e).context("failed to load module")),
+                };
+
+                // Evaluate the module - run mod_evaluate and event loop like deno_core tests
+                let _ = runtime.mod_evaluate(id);
+                match block_on(runtime.run_event_loop(Default::default())) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let msg = format!("{}", e);
+                        if msg.contains("__honey_exit__") {
+                            if let Some(code) = take_exit_request() {
+                                use std::io::Write as _;
+                                let _ = std::io::stdout().flush();
+                                let _ = std::io::stderr().flush();
+                                return (runtime, Ok(code));
+                            }
+                        }
+                        return (runtime, Err(e).context("event loop failed"));
+                    }
+                }
+                if phase_trace_enabled() {
+                    phase_trace("esm_eval+loop", t_eval.elapsed());
                 }
             }
-            phase_trace("esm_eval+loop", t_eval.elapsed());
         } else {
             // CommonJS main script: evaluate through the require machinery with a
             // correctly anchored per-module require.
