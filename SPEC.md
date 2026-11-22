@@ -154,7 +154,9 @@ honey migrate --file x.js  # single file
 - Infers types from usage patterns
 - Adds interface/type declarations for repeated shapes
 - Flags inferred types with `// @honey: inferred`
-- Incremental support
+- Incremental support (a `.ts` output newer than its `.js` source is skipped)
+- The migrated `.js` source is removed after a successful `.ts` write; parse
+  failures keep the original file and are reported per-file
 
 ---
 
@@ -207,8 +209,37 @@ let runtime = JsRuntime::new(RuntimeOptions {
 
 - Full compat layer (`deno_node` equivalent, built on upstream deno_core)
 - Target: 95%+ of npm packages at v0.1
-- Native addons (`.node`): v0.2
+- Native addons (`.node`): v0.2 (loading one fails with an explicit message today)
 - No Bun code. Upstream deno_core + V8, newest, unpinned. Clean room.
+
+Implemented today (verified against real npm packages — react/react-dom 19
+server render, chalk 5 native-ESM chain, zod 4 (CJS + ESM entries), lodash 4,
+semver 7.x classes (module cycles), dayjs, ms, picocolors):
+
+- **Builtins**: `path`, `fs` (+`fs/promises`), `os`, `util` (incl. `inspect`,
+  `format`, `promisify`, `styleText`, `TextEncoder`/`TextDecoder`),
+  `url`, `module`, `events`, `assert` (deep-equal family with cycle guards,
+  strict/loose variants, `throws` matching), `worker_threads`, `stream` stubs,
+  `child_process`, `tty`, `crypto` (hash/random bytes/UUID), `buffer`,
+  `querystring`, `readline`, `perf_hooks` (`performance.now`/`mark`),
+  `async_hooks` (synchronous `AsyncLocalStorage`), and `process` (module form
+  of the global process object).
+- **ESM↔CJS interop**: `require()` of ESM-only packages via an ESM→CJS
+  transform (multi-line imports/exports, `export {a as b}` lists, re-exports,
+  CJS named-export detection à la cjs-module-lexer for `import {x} from cjs`).
+  Explicit `.cjs` files are always CommonJS regardless of package `type`.
+  Node's `require(esm)` default-unwrap semantics for `module.exports =`
+  reassignments are preserved (interop annotations never decorate a
+  reassigned `module.exports`).
+- **Subpath `#` imports**: the package.json `imports` field (incl. conditional
+  `node` targets) resolves `#foo` specifiers against the nearest package.json —
+  chalk's `#ansi-styles` / `#supports-color` vendor-alias layout works.
+- **Deno-shaped compat probes**: deno_core registers a `globalThis.Deno` stub
+  (its ops object); packages like chalk/has-flag do
+  `globalThis.Deno ? Deno.args : process.argv`, so honey mirrors
+  `process.argv` into `Deno.args` after engine construction.
+- **Scoped packages**: `honey add @scope/name` supports the nested
+  `.cinm/@scope/name@x.y.z` layout (store entries stay flat).
 
 ---
 
@@ -343,7 +374,7 @@ Reference points behind the dev-loop row: a two-line `console.log` script runs i
 clap, tokio, reqwest (rustls-tls), serde, serde_json, flate2, tar, anyhow, futures,
 deno_core "0" (newest, unpinned — every build takes the latest crates.io release and
 its matched v8; currently 0.413 / v8 150.4.0),
-oxc_parser/transformer/semantic/codegen/allocator/ast/span (newest, unpinned),
+oxc_parser/transformer/semantic/codegen/allocator/ast/span (major-matched set, 0.40),
 oxc_sourcemap, libc
 ```
 
