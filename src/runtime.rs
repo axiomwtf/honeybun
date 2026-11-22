@@ -943,17 +943,29 @@ fn global_object_middleware(
     let set_dir_key = v8::String::new(scope, "__honeySetRequireDir").unwrap();
     global.set(scope, set_dir_key.into(), set_dir_fn.into());
 
-    // Inject console - check if console already exists first
+    // Inject/override console. Newer deno_core ships a built-in console on
+    // the snapshot context whose console.error prints to *stdout* (its own
+    // fd quirk), and the old is-absent guard never fired. Always re-point
+    // the fd-relevant methods at honey's fns: log/info -> fd 1,
+    // warn/error -> fd 2 (node semantics), so capture_stdio tagging and
+    // stderr-interleaving behave like node/bun.
     let console_key = v8::String::new(scope, "console").unwrap();
-    if global.get(scope, console_key.into()).is_none() {
-        let console = v8::Object::new(scope);
-        let log_fn = v8::Function::new(scope, console_log).unwrap();
-        let log_key = v8::String::new(scope, "log").unwrap();
-        console.set(scope, log_key.into(), log_fn.into());
-        let error_fn = v8::Function::new(scope, console_error).unwrap();
-        let error_key = v8::String::new(scope, "error").unwrap();
-        console.set(scope, error_key.into(), error_fn.into());
-        global.set(scope, console_key.into(), console.into());
+    let console = if let Some(existing) = global.get(scope, console_key.into()) {
+        existing.to_object(scope).unwrap_or_else(|| v8::Object::new(scope))
+    } else {
+        let c = v8::Object::new(scope);
+        global.set(scope, console_key.into(), c.into());
+        c
+    };
+    let log_fn = v8::Function::new(scope, console_log).unwrap();
+    for name in ["log", "info"] {
+        let k = v8::String::new(scope, name).unwrap();
+        console.set(scope, k.into(), log_fn.into());
+    }
+    let error_fn = v8::Function::new(scope, console_error).unwrap();
+    for name in ["warn", "error"] {
+        let k = v8::String::new(scope, name).unwrap();
+        console.set(scope, k.into(), error_fn.into());
     }
 
     // Inject process

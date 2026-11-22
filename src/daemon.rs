@@ -1394,12 +1394,126 @@ fn watch_test_session(stream: &mut UnixStream, request: &Request) {
     unsafe { libc::close(ifd); }
 }
 
-/// Wrap a closure with fd 1/2 redirected into pipes drained by a single
-/// poll() thread, returning what was written. Everything the runtime prints
-/// (including v8 callbacks and eprintln) is captured.
-pub fn capture_stdio<T>(f: impl FnOnce() -> T) -> (String, String, T) {
-    use std::os::unix::io::{FromRawFd, RawFd};
+// ---------- stdio capture ----------
 
+/// A queued capture pair for the persistent drainer thread.
+struct CaptureJob {
+    out_fd: libc::c_int,
+    err_fd: libc::c_int,
+    /// Forwarded chunks; None = both pipes at EOF (job done).
+    tx: std::sync::mpsc::Sender<Option<CaptureChunk>>,
+}
+
+#[derive(Debug)]
+enum CaptureChunk {
+    Out(Vec<u8>),
+    Err(Vec<u8>),
+}
+
+/// Whether this process is the daemon (long-lived, owns the warm engine and
+/// the persistent drainer) rather than a one-shot CLI run.
+fn is_daemon() -> bool {
+    static DAEMON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DAEMON.get_or_init(|| std::env::args().any(|a| a == "--internal-daemon"))
+}
+
+/// Lazily started persistent drainer, daemon-only: sleeps in recv() between
+/// requests, so a warm run pays no thread spawn/join at all (that cost
+/// ~60-80µs of every request when we spun a thread per capture).
+fn capture_queue() -> Option<&'static std::sync::mpsc::SyncSender<CaptureJob>> {
+    static QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<CaptureJob>>> =
+        std::sync::OnceLock::new();
+    QUEUE
+        .get_or_init(|| {
+            if !is_daemon() {
+                return None; // one-shot runs spawn a throwaway drainer instead
+            }
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CaptureJob>(0);
+            if std::thread::Builder::new()
+                .name("honey-stdio-drain".into())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        drain_capture_pipes(job);
+                    }
+                })
+                .is_err()
+            {
+                return None;
+            }
+            Some(tx)
+        })
+        .as_ref()
+}
+
+/// Drain one capture pair: poll both fds, forward chunks through `tx`, then
+/// send the None EOF marker once both read ends are closed.
+fn drain_capture_pipes(job: CaptureJob) {
+    use std::os::unix::io::FromRawFd;
+
+    let CaptureJob { out_fd, err_fd, tx } = job;
+    let mut pfds = [
+        libc::pollfd { fd: out_fd, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: err_fd, events: libc::POLLIN, revents: 0 },
+    ];
+    let mut files = [
+        unsafe { std::fs::File::from_raw_fd(out_fd) },
+        unsafe { std::fs::File::from_raw_fd(err_fd) },
+    ];
+    let mut buf = [0u8; 65536];
+    loop {
+        let r = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if r < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        let mut open = 0;
+        for i in 0..2 {
+            let pfd = &mut pfds[i];
+            if pfd.events == 0 {
+                continue; // already at EOF
+            }
+            if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                match files[i].read(&mut buf) {
+                    Ok(0) => {
+                        pfd.events = 0;
+                        continue;
+                    }
+                    Ok(n) => {
+                        let chunk = if i == 0 {
+                            CaptureChunk::Out(buf[..n].to_vec())
+                        } else {
+                            CaptureChunk::Err(buf[..n].to_vec())
+                        };
+                        // Unbounded channel: send never blocks, so a large
+                        // burst can't deadlock the drainer against a full
+                        // pipe while the request thread is still running JS.
+                        if tx.send(Some(chunk)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        pfd.events = 0;
+                        continue;
+                    }
+                }
+            }
+            open += 1;
+        }
+        if open == 0 {
+            break; // both pipes closed
+        }
+    }
+    let _ = tx.send(None);
+}
+
+/// Wrap a closure with fd 1/2 redirected into pipes, returning what was
+/// written. Everything the runtime prints (including v8 callbacks and
+/// eprintln) is captured. In the daemon the pipes are drained by one
+/// persistent worker thread; one-shot runs fall back to a dedicated thread.
+pub fn capture_stdio<T>(f: impl FnOnce() -> T) -> (String, String, T) {
     let mut out_pipe = [0 as libc::c_int; 2];
     let mut err_pipe = [0 as libc::c_int; 2];
     unsafe {
@@ -1416,46 +1530,25 @@ pub fn capture_stdio<T>(f: impl FnOnce() -> T) -> (String, String, T) {
         libc::dup2(err_pipe[1], 2);
     }
 
-    let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let (err_tx, err_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    // One thread drains both pipes; half the per-request thread-spawn cost.
-    let out_fd: RawFd = out_pipe[0];
-    let err_fd: RawFd = err_pipe[0];
-    let out_tx2 = out_tx.clone();
-    let err_tx2 = err_tx.clone();
-    let drainer = std::thread::spawn(move || {
-        let mut pfds = [
-            libc::pollfd { fd: out_fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: err_fd, events: libc::POLLIN, revents: 0 },
-        ];
-        let mut out_file = unsafe { std::fs::File::from_raw_fd(out_fd) };
-        let mut err_file = unsafe { std::fs::File::from_raw_fd(err_fd) };
-        let mut buf = [0u8; 16384];
-        loop {
-            // Block until either pipe has data.
-            let r = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
-            if r < 0 {
-                break;
-            }
-            let mut open = 0;
-            for (i, pfd) in pfds.iter_mut().enumerate() {
-                if pfd.revents & libc::POLLIN != 0 {
-                    let (file, tx) = if i == 0 { (&mut out_file, &out_tx2) } else { (&mut err_file, &err_tx2) };
-                    match file.read(&mut buf) {
-                        Ok(0) => pfd.events = 0, // EOF; stop polling this fd
-                        Ok(n) => { let _ = tx.send(buf[..n].to_vec()); open += 1; }
-                        Err(_) => { pfd.events = 0; }
-                    }
-                }
-                if pfd.events != 0 && pfd.revents & (libc::POLLHUP | libc::POLLERR) == 0 {
-                    open += 1;
-                }
-            }
-            if open == 0 {
-                break; // both pipes closed
-            }
-        }
-    });
+    let (tx, rx) = std::sync::mpsc::channel::<Option<CaptureChunk>>();
+    let job = CaptureJob { out_fd: out_pipe[0], err_fd: err_pipe[0], tx };
+    // Try the persistent worker first (rendezvous handoff: try_send only
+    // succeeds when the worker is idle in recv()); on failure or outside
+    // the daemon, drain on a dedicated throwaway thread.
+    enum Dispatch {
+        Persistent,
+        Thread(std::thread::JoinHandle<()>),
+    }
+    let dispatch = match capture_queue() {
+        Some(q) => match q.try_send(job) {
+            Ok(()) => Dispatch::Persistent,
+            Err(
+                std::sync::mpsc::TrySendError::Full(job)
+                | std::sync::mpsc::TrySendError::Disconnected(job),
+            ) => Dispatch::Thread(std::thread::spawn(move || drain_capture_pipes(job))),
+        },
+        None => Dispatch::Thread(std::thread::spawn(move || drain_capture_pipes(job))),
+    };
 
     let result = f();
 
@@ -1470,17 +1563,20 @@ pub fn capture_stdio<T>(f: impl FnOnce() -> T) -> (String, String, T) {
         libc::close(err_pipe[1]);
     }
 
-    // Close our copies of the write ends; the drain thread sees EOF on both
-    // pipes and exits, so data isn't lost to a late join.
-    drainer.join().ok();
-
+    // Collect until the EOF marker (both write ends are closed above, so the
+    // drainer always finishes). No join and no thread teardown on the daemon
+    // hot path.
     let mut out_bytes = Vec::new();
-    while let Ok(chunk) = out_rx.try_recv() {
-        out_bytes.extend_from_slice(&chunk);
-    }
     let mut err_bytes = Vec::new();
-    while let Ok(chunk) = err_rx.try_recv() {
-        err_bytes.extend_from_slice(&chunk);
+    while let Ok(next) = rx.recv() {
+        match next {
+            Some(CaptureChunk::Out(c)) => out_bytes.extend_from_slice(&c),
+            Some(CaptureChunk::Err(c)) => err_bytes.extend_from_slice(&c),
+            None => break,
+        }
+    }
+    if let Dispatch::Thread(h) = dispatch {
+        let _ = h.join();
     }
 
     (
@@ -1661,6 +1757,26 @@ fn spawn_daemon() -> Result<()> {
 
 fn request_raw(req: &Request, mut stream: UnixStream) -> Option<Vec<u8>> {
     write_msg(&mut stream, req).ok()?;
+    // Spin briefly before blocking: a warm request answers in well under
+    // 300µs, and busy-polling avoids two scheduler round-trips (client
+    // descheduling -> daemon wake -> client wake + reschedule) that cost
+    // more wall time than the spin itself, especially under load.
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(500);
+        loop {
+            let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if r != 0 {
+                break; // data ready (or error; read_msg will surface it)
+            }
+            if std::time::Instant::now() >= deadline {
+                break; // fall through to blocking read
+            }
+            std::hint::spin_loop();
+        }
+    }
     read_msg(&mut stream)
 }
 
