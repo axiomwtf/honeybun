@@ -47,6 +47,7 @@ One static binary. No runtime files. No `.so`. No sidecar.
 - Spawned by `honey start`, or auto-spawned by the CLI on first `honey run`
 - Listens on `/run/user/$UID/honey.sock` (chmod 0600, removed on exit)
 - Holds one warm V8 isolate across runs; IPC round-trip ~0.2ms on top of a ~90µs process floor
+- Idle footprint ~20 MB RSS
 - Crash recovery: the CLI falls back to in-process execution if the socket is dead. `honey stop` kills the daemon.
 - Rebuilds: a running daemon keeps executing the code it was spawned with. After `cargo build`, run `honey stop` once so the next `honey run` auto-spawns the new binary.
 - Env knobs: `HONEY_NO_DAEMON=1` (disable), `HONEY_SOCKET` (path override), `HONEY_TRACE=1` (trace, forces cold), `HONEY_DAEMON_LOG` (daemon trace file)

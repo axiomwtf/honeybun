@@ -49,7 +49,7 @@ honey (CLI, daemon, PM) → Cinnamon (engine) → V8 (upstream, newest) (runtime
 - Auto-spawned by the CLI on first `honey run`; managed with `honey start` / `honey stop`
 - Listens on `/run/user/$UID/honey.sock` (chmod 0600, removed on exit)
 - Holds one warm V8 isolate across runs, with an mtime-validated module cache (edit a dependency, the next run picks it up)
-- IPC round-trip ~0.2ms on top of a ~90µs process floor
+- IPC round-trip ~0.2ms on top of a ~90µs process floor, and it idles at ~20 MB
 - Crash recovery: the CLI falls back to in-process execution if the socket is dead. `honey` always works.
 - Rebuilds: a running daemon keeps executing the code it was spawned with — run `honey stop` once after `cargo build` so the next run picks up the new binary.
 
