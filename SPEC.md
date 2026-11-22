@@ -311,8 +311,9 @@ export default defineConfig({
 - Zero config out of the box
 - Fully scriptable when you need it
 - Runs in the daemon's warm V8 isolate (no extra engine)
+- Script tasks: `honey run <task>` with no file of that name resolves the task from `scripts` in the config — a string is the shell command, a function of ctx `{args}` returns the command; run through `sh -c 'exec <command> "$@"'` with extra CLI args appended. An existing file always wins over a script task.
 
-**v0.1 status (implemented):** `onInstall`, `onBuild`, `onRun`, `onTest` fire around the corresponding commands; `honey.config.ts` (or `.js`) is discovered in the cwd, ESM→CJS-transformed and evaluated, `defineConfig` unwrapped, and the hook called with a JSON ctx object. Hooks are advisory-only in v0.1: they can log or mutate config-visible state, hook errors print a warning and never fail the command, `onResolve`/`transform` are accepted but ignored, and the config file cannot yet `require`/import other modules or npm packages.
+**v0.1 status (implemented):** `onInstall`, `onBuild`, `onRun`, `onTest` fire around the corresponding commands; `honey.config.ts` (or `.js`) is discovered in the cwd, ESM→CJS-transformed and evaluated, `defineConfig` unwrapped, and the hook called with a JSON ctx object. `onRun` ctx: `{file}`; `onInstall`: `{cmd, production|package, dev}`; `onBuild`: `{cmd}`; `onTest`: `{filter}`. Hooks are advisory-only in v0.1: they can log or mutate config-visible state, hook errors print a warning and never fail the command, `onResolve`/`transform` are accepted but ignored, and the config file cannot yet `require`/import other modules or npm packages.
 
 ---
 

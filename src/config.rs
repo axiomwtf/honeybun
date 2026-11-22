@@ -88,6 +88,67 @@ fn cjs_config(source: &str) -> String {
     out
 }
 
+/// Build the lookup script for a named script task: pick `cfg.scripts[name]`.
+/// A string is the command as-is; a function receives ctx {args} and returns
+/// the command string (so tasks can shape shell invocations with arguments).
+fn script_script(transpiled: &str, name: &str, ctx_json: &str) -> String {
+    format!(
+        r#"(function(){{
+var module = {{ exports: {{}} }}; var exports = module.exports;
+var defineConfig = function (config) {{ return config; }};
+{transpiled}
+var cfg = (module.exports && typeof module.exports === "object" && module.exports.default !== undefined) ? module.exports.default : (module.exports && typeof module.exports === "object" ? module.exports : null);
+var map = cfg && cfg["scripts"];
+if (!map || typeof map !== "object") return null;
+var v = map["{name}"];
+if (typeof v === "function") return v({{ args: {ctx} }});
+if (typeof v === "string") return v;
+return null;
+}})()"#,
+        transpiled = transpiled,
+        name = name,
+        ctx = ctx_json
+    )
+}
+
+/// Resolve a named script task (`honey run <task>`) from the config: a
+/// `scripts` map whose values are shell commands (strings) or functions of
+/// ctx {args} returning a shell command. Returns the command to execute, or
+/// None when no config, no such task, or the shape is unusable. Task names
+/// are restricted to path-friendly characters so they can never inject into
+/// the generated script.
+pub fn resolve_script(name: &str, args: &[String]) -> Option<String> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:@/".contains(c))
+    {
+        return None;
+    }
+    let path = find_config()?;
+    let transpiled = load_transpiled(&path)?;
+    let args_json = match serde_json::to_string(&args) {
+        Ok(j) => j,
+        Err(_) => return None,
+    };
+    let code = script_script(&transpiled, name, &args_json);
+    let json = eval_quiet(&code)?;
+    // A function that returned a non-string (number, object) is not a
+    // runnable command: treat it as no script rather than guessing.
+    serde_json::from_str::<String>(&json).ok()
+}
+
+/// Evaluate in the daemon's warm engine when available, else a fresh engine.
+/// Returns the raw JSON-encoded result. Unlike fire(), nothing is printed:
+/// script resolution is plumbing, not advisory output.
+fn eval_quiet(code: &str) -> Option<String> {
+    match crate::daemon::eval_via_daemon(code) {
+        Some(resp) if resp.error.is_none() => resp.file,
+        Some(_) => None,
+        None => crate::runtime::Runtime::new().eval_code(code).ok().flatten(),
+    }
+}
+
 /// Fire a hook. Returns the hook's JSON-serialized return value when present.
 /// Never fails the caller: hook errors are warnings on stderr.
 pub fn fire(hook: &str, ctx_json: &str) -> Option<String> {
@@ -168,5 +229,59 @@ mod tests {
         let rt = crate::runtime::Runtime::new();
         let out = rt.eval_code(&js).ok().flatten();
         assert_eq!(out.as_deref(), None);
+    }
+
+    #[test]
+    fn script_task_string_resolves() {
+        let cfg = cjs_config(
+            "export default defineConfig({\n  scripts: {\n    dev: \"bun scripts/run.ts dev\",\n  },\n});",
+        );
+        let js = script_script(&cfg, "dev", "[]");
+        let rt = crate::runtime::Runtime::new();
+        let out = rt.eval_code(&js).ok().flatten();
+        assert_eq!(out.as_deref(), Some("\"bun scripts/run.ts dev\""));
+    }
+
+    #[test]
+    fn script_task_function_gets_args() {
+        let cfg = cjs_config(
+            "export default defineConfig({ scripts: { hello(ctx) { return 'echo ' + ctx.args.length; } } });",
+        );
+        let js = script_script(&cfg, "hello", r#"["a","b"]"#);
+        let rt = crate::runtime::Runtime::new();
+        let out = rt.eval_code(&js).ok().flatten();
+        assert_eq!(out.as_deref(), Some("\"echo 2\""));
+    }
+
+    #[test]
+    fn script_task_missing_name_is_null() {
+        let cfg = cjs_config("export default defineConfig({ scripts: { dev: \"true\" } });");
+        let js = script_script(&cfg, "nope", "[]");
+        let rt = crate::runtime::Runtime::new();
+        let out = rt.eval_code(&js).ok().flatten();
+        assert_eq!(out.as_deref(), None);
+    }
+
+    #[test]
+    fn resolve_script_rejects_injection_names() {
+        assert!(resolve_script("dev; rm -rf /", &[]).is_none());
+        assert!(resolve_script("\"dev\"", &[]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod script_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_script_end_to_end() {
+        let tmp = std::env::temp_dir().join(format!("honey_conf_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&tmp.join("honey.config.ts"), "export default defineConfig({ scripts: { dev: \"echo hi\" } });").unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+        let got = resolve_script("dev", &[]);
+        std::env::set_current_dir("/").unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert_eq!(got.as_deref(), Some("echo hi"));
     }
 }

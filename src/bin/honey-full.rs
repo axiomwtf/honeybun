@@ -827,6 +827,25 @@ fn main() {
             inline_watch(&file, &args);
             return;
         }
+        // Script tasks from honey.config.ts: `honey run dev` with no ./dev
+        // file but a `scripts.dev` entry in the config runs that command
+        // through the shell. The file wins when both exist.
+        if !std::path::Path::new(&file).exists() {
+            if let Some(command) = honey::config::resolve_script(&file, &args) {
+                let mut cmd = std::process::Command::new("sh");
+                cmd.arg("-c").arg(&format!("exec {command} \"$@\"")).arg(&file);
+                for a in &args {
+                    cmd.arg(a);
+                }
+                match cmd.status() {
+                    Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+                    Err(e) => {
+                        eprintln!("honey: failed to run script '{file}': {e}");
+                        std::process::exit(127);
+                    }
+                }
+            }
+        }
         honey::config::fire("onRun", &format!(r#"{{"file":"{file}"}}"#));
         if let Some(resp) = daemon::run_via_daemon(&file, &args) {
             use std::io::Write as _;
@@ -893,6 +912,30 @@ fn main() {
             }
         }
         Commands::Run { file, args, watch } => {
+            // Script tasks from honey.config.ts: `honey run dev` with no ./dev
+            // file but a `scripts.dev` entry in the config runs that command
+            // through the shell. The file wins when both exist.
+            if !std::path::Path::new(&file).exists() {
+                if let Some(command) = honey::config::resolve_script(&file, &args) {
+                    if watch {
+                        eprintln!("honey: warning: --watch is not supported for config scripts");
+                    }
+                    let mut cmd = std::process::Command::new("sh");
+                    cmd.arg("-c")
+                        .arg(&format!("exec {command} \"$@\""))
+                        .arg(&file);
+                    for a in &args[..] {
+                        cmd.arg(a);
+                    }
+                    match cmd.status() {
+                        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+                        Err(e) => {
+                            eprintln!("honey: failed to run script '{file}': {e}");
+                            std::process::exit(127);
+                        }
+                    }
+                }
+            }
             honey::config::fire("onRun", &format!(r#"{{"file":"{file}"}}"#));
             if watch {
                 if let Some(()) = daemon::watch_via_daemon(&file, &args) {

@@ -484,8 +484,20 @@ pub(crate) fn resolve_entry_input(entry_input: &str, cwd: &Path) -> Result<PathB
     };
     resolve_with_extensions(&entry_input_path)
         .or_else(|_| {
-            const DEFAULTS: [&str; 5] =
-                ["src/index.js", "src/index.jsx", "src/index.mjs", "src/index.mts", "index.js"];
+            const DEFAULTS: [&str; 12] = [
+                "src/index.js",
+                "src/index.jsx",
+                "src/index.mjs",
+                "src/index.mts",
+                "src/main.ts",
+                "src/main.tsx",
+                "src/main.js",
+                "src/main.jsx",
+                "src/main.mts",
+                "index.ts",
+                "index.jsx",
+                "index.js",
+            ];
             DEFAULTS
                 .iter()
                 .filter_map(|c| {
