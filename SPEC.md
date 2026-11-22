@@ -248,8 +248,14 @@ semver 7.x classes (module cycles), dayjs, ms, picocolors):
 
 - Default registry: npm
   ```bash
-  honey install              # npm
+  honey install              # install this project's dependencies (honey.lock + .cinm)
+  hxney npm <args>           # npm-style package management: hxney proxies a bundled npm
+  hxney npm install -g <pkg> # global installs live under ~/.cache/honey/npm-global
   ```
+  `hxney npm` bootstraps the npm package itself into the shared store
+  (`~/.cache/honey/store/npm@<version>`) on first use and runs its CLI on
+  the Node-compatible runner on PATH (node, falling back to bun). `honey
+  install <pkg>` / `-g` is rejected with a pointer to `hxney npm`.
 - Lockfile: `honey.lock` (binary format, fast)
 - Can read `package-lock.json` for migration
 - Parallel downloads (tokio) — implemented: concurrent BFS waves over a `Semaphore(8)`, shared HTTP client, shared-store dedupe, atomic single-write lockfile

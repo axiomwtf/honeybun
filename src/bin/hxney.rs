@@ -53,10 +53,7 @@ fn exec_full() -> ! {
     let err = std::process::Command::new(&full)
         .args(std::env::args_os().skip(1))
         .exec();
-    eprintln!(
-        "error: hxney launcher could not exec {} ({err}); is hxney-full installed next to it?",
-        full.display()
-    );
+    eprintln!("error: hxney launcher failed to start its engine ({err}); reinstall hxney");
     std::process::exit(127);
 }
 
@@ -116,6 +113,12 @@ fn main() {
     if argv.len() == 2 && (argv[1] == "--version" || argv[1] == "-V") {
         println!("hxney {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+
+    // `hxney npm` always takes the full path (its npm bootstrap lives in the
+    // full binary); never let a stray .cinm/npm@ entry shadow it.
+    if argv.len() >= 2 && argv[1] == "npm" {
+        exec_full();
     }
 
     // Package-management and daemon subcommands are `honey` commands, not

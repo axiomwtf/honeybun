@@ -55,10 +55,7 @@ fn exec_full(argv0: &str) -> ! {
     let err = std::process::Command::new(&full)
         .args(std::env::args_os().skip(1))
         .exec();
-    eprintln!(
-        "error: honey launcher could not exec {} ({err}); is honey-full installed next to it?",
-        full.display()
-    );
+    eprintln!("error: honey launcher failed to start its engine ({err}); reinstall honey");
     std::process::exit(127);
 }
 

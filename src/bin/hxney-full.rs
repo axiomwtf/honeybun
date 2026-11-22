@@ -4,10 +4,11 @@ use honey::runtime::Runtime;
 use honey::PackageManager;
 use serde_json;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "hxney")]
+#[command(bin_name = "hxney")]
 #[command(author = "AXIOM")]
 #[command(version = "0.1.0")]
 #[command(about = "One-off package executor (npx/bunx equivalent)", long_about = None)]
@@ -20,12 +21,144 @@ struct Cli {
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+
+    // `hxney npm <args>`: npm-style package management, backed by a bundled
+    // npm living in the shared package store. Handled before Cli::parse so
+    // npm's own flags (-g etc.) pass through untouched.
+    if argv.len() >= 2 && argv[1] == "npm" {
+        let args: Vec<String> = argv[2..].to_vec();
+        if let Err(e) = run_npm(&args) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let cli = Cli::parse();
 
     if let Err(e) = execute_package(&cli.package, &cli.args) {
         eprintln!("error: {}", e);
         std::process::exit(1);
     }
+}
+
+/// npm bootstrap: the npm package itself is installed once into the shared
+/// package store (`~/.cache/honey/store/npm@<version>`), same place every
+/// other hxney package lives, then executed with the Node-compatible runner
+/// on PATH (node, falling back to bun). `hxney npm install -g <pkg>` keeps
+/// its global tree under `~/.cache/honey/npm-global` unless the user has
+/// already set a prefix, so no sudo and no system writes.
+fn run_npm(args: &[String]) -> Result<()> {
+    let cli = ensure_npm_cli()?;
+    let runner = find_node_runner().with_context(|| {
+        "`hxney npm` runs npm on a Node-compatible runner, but neither node nor bun was found on PATH"
+    })?;
+
+    let mut cmd = std::process::Command::new(&runner);
+    cmd.arg(&cli).args(args);
+    let wants_global = args.iter().any(|a| a == "-g" || a == "--global");
+    if wants_global && std::env::var_os("npm_config_prefix").is_none() {
+        if let Some(prefix) = honey::cinm::shared_store_root()
+            .parent()
+            .map(|p| p.join("npm-global"))
+        {
+            cmd.env("npm_config_prefix", &prefix);
+        }
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run npm with {}", runner.display()))?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Latest npm, extracted into the shared store. Idempotent and race-safe:
+/// extraction lands in a private temp dir that is renamed into place.
+fn ensure_npm_cli() -> Result<PathBuf> {
+    let store = honey::cinm::shared_store_root();
+
+    // Already bootstrapped? Pick the highest version present.
+    let mut found: Option<(String, PathBuf)> = None;
+    if let Ok(rd) = fs::read_dir(&store) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("npm@") {
+                match &found {
+                    Some((v, _)) if *v >= name => {}
+                    _ => found = Some((name, entry.path())),
+                }
+            }
+        }
+    }
+    if let Some((_, dir)) = found {
+        let cli = dir.join("bin/npm-cli.js");
+        if cli.is_file() {
+            return Ok(cli);
+        }
+    }
+
+    // Fetch the newest npm from the registry and unpack it store-side.
+    println!("hxney: installing npm into the package store...");
+    let registry = honey::registry::Registry::new();
+    let pkg = registry.resolve_version("npm", "latest")?;
+    let resp = reqwest::blocking::get(&pkg.dist.tarball)
+        .context("failed to download the npm tarball")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("failed to download npm: status {}", resp.status());
+    }
+    let bytes = resp.bytes().context("failed to read the npm tarball")?.to_vec();
+
+    let dest = store.join(format!("npm@{}", pkg.version));
+    if !dest.exists() {
+        fs::create_dir_all(&store).ok();
+        let tmp = store.join(format!(".tmp-npm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).context("failed to create the npm staging dir")?;
+        let tgz = tmp.join("npm.tgz");
+        fs::write(&tgz, &bytes).context("failed to write the npm tarball")?;
+        honey::cinm::extract_tarball(&tgz, &tmp.join("npm"))
+            .context("failed to extract the npm tarball")?;
+        match fs::rename(tmp.join("npm"), &dest) {
+            Ok(()) => {}
+            Err(_) if dest.exists() => {} // lost a race; the winner is fine
+            Err(e) => return Err(e).context("failed to move npm into the package store"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    let cli = dest.join("bin/npm-cli.js");
+    if !cli.is_file() {
+        anyhow::bail!(
+            "npm bootstrap incomplete: bin/npm-cli.js missing from npm@{}",
+            pkg.version
+        );
+    }
+    Ok(cli)
+}
+
+/// node first, bun second (bun runs plain npm-cli.js CJS scripts fine).
+fn find_node_runner() -> Option<PathBuf> {
+    which("node").or_else(|| which("bun"))
+}
+
+fn which(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(&candidate)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn execute_package(package: &str, args: &[String]) -> Result<()> {

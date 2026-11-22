@@ -4,6 +4,7 @@ use honey::{PackageManager, Runtime};
 
 #[derive(Parser)]
 #[command(name = "honey")]
+#[command(bin_name = "honey")]
 #[command(author = "AXIOM")]
 #[command(version = "0.1.0")]
 #[command(about = "Up to 8.4x faster than Bun. Up to 23x faster than Node. One binary. One toolchain.", long_about = None)]
@@ -19,6 +20,12 @@ enum Commands {
         /// Production only
         #[arg(short = 'p')]
         production: bool,
+        /// Global install (not supported here — use `hxney npm install -g`)
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+        /// Package names — only valid with `hxney npm install <pkg>`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        packages: Vec<String>,
     },
     /// Add a package
     Add {
@@ -879,7 +886,20 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Install { production } => {
+        Commands::Install { production, global, packages } => {
+            if global || !packages.is_empty() {
+                // Package installs belong to hxney, not the project installer.
+                let pkgs = packages.join(" ");
+                eprintln!("honey install only installs this project's dependencies.");
+                if global {
+                    eprintln!("To install a package globally:");
+                    eprintln!("  hxney npm install -g {pkgs}");
+                } else {
+                    eprintln!("To install a package:");
+                    eprintln!("  hxney npm install {pkgs}");
+                }
+                std::process::exit(2);
+            }
             honey::config::fire("onInstall", &format!(r#"{{"cmd":"install","production":{production}}}"#));
             let pm = PackageManager::new(std::path::Path::new("."));
             if let Err(e) = pm.install(production) {

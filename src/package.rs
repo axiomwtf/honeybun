@@ -3,7 +3,11 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageJson {
+    /// npm allows package.json without a name (tools, scratch dirs) —
+    /// default it instead of failing the whole install.
+    #[serde(default = "default_project_name")]
     pub name: String,
+    #[serde(default = "default_project_version")]
     pub version: String,
     #[serde(default)]
     pub dependencies: HashMap<String, String>,
@@ -82,4 +86,11 @@ pub struct RegistryResponse {
     #[serde(rename = "dist-tags")]
     pub dist_tags: HashMap<String, String>,
     pub versions: HashMap<String, RegistryPackage>,
+}
+fn default_project_name() -> String {
+    "project".to_string()
+}
+
+fn default_project_version() -> String {
+    "0.0.0".to_string()
 }

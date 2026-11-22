@@ -342,7 +342,7 @@ fn hard_link_tree(src: &Path, dst: &Path, fallback_copy: bool) -> Result<bool> {
     Ok(true)
 }
 
-fn extract_tarball(tarball: &Path, dest: &Path) -> Result<()> {
+pub fn extract_tarball(tarball: &Path, dest: &Path) -> Result<()> {
     let file = fs::File::open(tarball).context("failed to open tarball")?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
