@@ -2,6 +2,7 @@ pub mod build;
 pub mod cinm;
 pub mod config;
 pub mod daemon;
+pub mod migrate;
 pub mod package;
 pub mod registry;
 pub mod runtime;
@@ -69,7 +70,20 @@ impl PackageManager {
         self.layout.cleanup_temp_dirs();
 
         let existing_lock = Self::read_lockfile();
-        let lockfile = self.resolve_and_download(&all_deps, existing_lock)?;
+        // Migration: npm's package-lock.json fills the packages honey.lock
+        // does not know yet (exact versions + integrity, no re-resolution).
+        let mut existing_lock = existing_lock.unwrap_or_else(Lockfile::new);
+        let mut migrated = 0usize;
+        for (name, entry) in Self::read_npm_lockfile() {
+            if !existing_lock.packages.contains_key(&name) {
+                existing_lock.packages.insert(name, entry);
+                migrated += 1;
+            }
+        }
+        if migrated > 0 {
+            println!("  migrated {} pinned package(s) from package-lock.json", migrated);
+        }
+        let lockfile = self.resolve_and_download(&all_deps, Some(existing_lock))?;
         self.write_lockfile(&lockfile)?;
 
         self.layout.create_node_modules_symlink(Path::new("."))?;
@@ -81,6 +95,110 @@ impl PackageManager {
     fn read_lockfile() -> Option<Lockfile> {
         let data = std::fs::read("honey.lock").ok()?;
         Lockfile::from_binary(&data)
+    }
+
+    /// Read npm's `package-lock.json` (v1/v2/v3) so a project migrating from
+    /// npm keeps its exact resolved versions + integrity hashes instead of
+    /// re-resolving semver ranges to whatever is newest today. Entries only
+    /// ever fill gaps: a package pinned by an existing honey.lock wins.
+    fn read_npm_lockfile() -> Vec<(String, crate::package::LockEntry)> {
+        let data = match std::fs::read_to_string("package-lock.json") {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let json: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(j) => j,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+
+        // v2/v3 layout: packages: { "node_modules/<name>": {version, resolved, integrity, dependencies} }
+        if let Some(packages) = json.get("packages").and_then(|p| p.as_object()) {
+            for (key, meta) in packages {
+                let name = match key.strip_prefix("node_modules/") {
+                    Some(n) if !n.is_empty() => n.to_string(),
+                    _ => continue,
+                };
+                let version = match meta.get("version").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => continue,
+                };
+                let resolved = meta
+                    .get("resolved")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let integrity = meta
+                    .get("integrity")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let dependencies = meta
+                    .get("dependencies")
+                    .and_then(|d| d.as_object())
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| {
+                                v.as_str().map(|s| (k.clone(), s.to_string()))
+                            })
+                            .collect::<HashMap<String, String>>()
+                    })
+                    .unwrap_or_default();
+                out.push((
+                    name,
+                    crate::package::LockEntry {
+                        version,
+                        resolved,
+                        integrity,
+                        dependencies,
+                        dev: false,
+                    },
+                ));
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+
+        // v1 layout: dependencies: { "<name>": {version, resolved, integrity, requires} }
+        if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
+            for (name, meta) in deps {
+                let version = match meta.get("version").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => continue,
+                };
+                let resolved = meta
+                    .get("resolved")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let integrity = meta
+                    .get("integrity")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let dependencies = meta
+                    .get("requires")
+                    .and_then(|d| d.as_object())
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| {
+                                v.as_str().map(|s| (k.clone(), s.to_string()))
+                            })
+                            .collect::<HashMap<String, String>>()
+                    })
+                    .unwrap_or_default();
+                out.push((
+                    name.clone(),
+                    crate::package::LockEntry {
+                        version,
+                        resolved,
+                        integrity,
+                        dependencies,
+                        dev: false,
+                    },
+                ));
+            }
+        }
+        out
     }
 
     fn resolve_and_download(&self, deps: &HashMap<String, String>, existing_lock: Option<Lockfile>) -> Result<Lockfile> {
@@ -136,10 +254,13 @@ impl PackageManager {
                     let outcome: Result<PackageOutcome> = async {
                         let _permit = semaphore.acquire().await.expect("semaphore closed");
 
-                        // A package already present in honey.lock with its
-                        // .cinm directory intact needs no network at all.
+                        // A package pinned by honey.lock (or migrated from
+                        // package-lock.json) uses its locked version and
+                        // tarball URL verbatim — even when .cinm lost the
+                        // directory — so installs are reproducible. Only an
+                        // unlisted package hits the registry.
                         let pkg = match existing_lock.packages.get(&name) {
-                            Some(entry) if layout.package_dir(&name, &entry.version).exists() => {
+                            Some(entry) if !entry.resolved.is_empty() => {
                                 RegistryPackage {
                                     name: name.clone(),
                                     version: entry.version.clone(),
@@ -302,8 +423,7 @@ impl PackageManager {
         let content = serde_json::to_string_pretty(&pkg)?;
         std::fs::write(path, content).context("failed to write package.json")?;
 
-        let dir = self.layout.package_dir(package, "*");
-        if dir.exists() {
+        for dir in self.layout.all_package_dirs(package) {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
