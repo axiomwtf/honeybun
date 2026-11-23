@@ -75,6 +75,19 @@ pub struct Request {
     /// client flag), saving a double file-read per test on the client.
     #[serde(default)]
     pub snapshot_update: bool,
+    /// cmd "hook": config hook name and its JSON context. The daemon builds
+    /// the hook script (config transpilation) and evaluates it on the warm
+    /// run engine, so the thin `honey` client never links the config/oxc code.
+    #[serde(default)]
+    pub hook: String,
+    #[serde(default)]
+    pub hook_ctx: String,
+    /// cmd "install": production-only dependency install.
+    #[serde(default)]
+    pub production: bool,
+    /// cmd "add": install as a dev dependency.
+    #[serde(default)]
+    pub dev: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -277,6 +290,7 @@ fn spawn_test_engine() -> std::sync::mpsc::Sender<TestJob> {
 }
 
 pub fn serve() {
+    mark_daemon();
     // A daemon crash used to be invisible (stderr nulled) and surfaced only
     // as a mysterious ~1s client stall + respawn. Log panics to disk.
     std::panic::set_hook(Box::new(|info| {
@@ -499,6 +513,99 @@ pub fn serve() {
                     error,
                     ..Default::default()
                 });
+            }
+            "hook" => {
+                // Config hooks are TypeScript: the daemon builds the script
+                // (oxc, no V8) and evaluates it on the warm run engine. This
+                // is what lets the thin `honey` client fire hooks without
+                // linking the config/runtime code.
+                let req = request.clone();
+                let code = crate::config::hook_code(&req.hook, &req.hook_ctx);
+                let response = match code {
+                    Some(code) => {
+                        let eval = Request {
+                            cmd: "eval".into(),
+                            code,
+                            cwd: req.cwd,
+                            ..Default::default()
+                        };
+                        on_run_engine(&run_tx, eval, true)
+                            .unwrap_or_else(|| fail_response("run engine unavailable".into()))
+                    }
+                    None => Response::default(),
+                };
+                let _ = write_msg(&mut stream, &response);
+            }
+            "script" => {
+                // Resolve a `scripts.<name>` task from honey.config.ts.
+                let req = request.clone();
+                let code = crate::config::script_code(&req.file, &req.args);
+                let response = match code {
+                    Some(code) => {
+                        let eval = Request {
+                            cmd: "eval".into(),
+                            code,
+                            cwd: req.cwd,
+                            ..Default::default()
+                        };
+                        on_run_engine(&run_tx, eval, true)
+                            .unwrap_or_else(|| fail_response("run engine unavailable".into()))
+                    }
+                    None => Response::default(),
+                };
+                let _ = write_msg(&mut stream, &response);
+            }
+            "install" => {
+                let req = request.clone();
+                let (out, err, result) = capture_stdio(move || -> anyhow::Result<()> {
+                    if !req.cwd.is_empty() {
+                        let _ = std::env::set_current_dir(&req.cwd);
+                    }
+                    crate::PackageManager::new(std::path::Path::new(".")).install(req.production)
+                });
+                let _ = write_msg(&mut stream, &result_response(out, err, result));
+            }
+            "add" => {
+                let req = request.clone();
+                let packages = req.args.clone();
+                let dev = req.dev;
+                let (out, err, result) = capture_stdio(move || -> anyhow::Result<()> {
+                    if !req.cwd.is_empty() {
+                        let _ = std::env::set_current_dir(&req.cwd);
+                    }
+                    let pm = crate::PackageManager::new(std::path::Path::new("."));
+                    for pkg in &packages {
+                        pm.add(pkg, dev)?;
+                    }
+                    Ok(())
+                });
+                let _ = write_msg(&mut stream, &result_response(out, err, result));
+            }
+            "remove" => {
+                let req = request.clone();
+                let package = req.file.clone();
+                let (out, err, result) = capture_stdio(move || -> anyhow::Result<()> {
+                    if !req.cwd.is_empty() {
+                        let _ = std::env::set_current_dir(&req.cwd);
+                    }
+                    crate::PackageManager::new(std::path::Path::new(".")).remove(&package)
+                });
+                let _ = write_msg(&mut stream, &result_response(out, err, result));
+            }
+            "migrate" => {
+                let req = request.clone();
+                let file = if req.file.is_empty() {
+                    None
+                } else {
+                    Some(req.file.clone())
+                };
+                let (out, err, result) = capture_stdio(move || -> anyhow::Result<()> {
+                    if !req.cwd.is_empty() {
+                        let _ = std::env::set_current_dir(&req.cwd);
+                    }
+                    crate::migrate::migrate(file.as_deref())
+                });
+                let _ = write_msg(&mut stream, &result_response(out, err, result));
             }
             "test_batch" => {
                 // Warm test suite. Default: the whole suite splits into
@@ -861,21 +968,7 @@ fn build_watch_session(stream: &mut UnixStream, request: &Request) {
 fn serve_test_batch(mut req: Request, runtime: &crate::runtime::Runtime) -> TestBatchResponse {
     // Daemon-side wrapper building: empty preloads mean the client skipped
     // the per-file read (the daemon already reads every file to run it).
-    // ESM sniff + shim marker come along from lib::runtime.
-    if req.args.iter().enumerate().any(|(i, f)| !f.is_empty() && req.preloads.get(i).map(String::is_empty).unwrap_or(true)) {
-        let mut preloads: Vec<String> = req.preloads.clone();
-        for (i, f) in req.args.iter().enumerate() {
-            if f.is_empty() {
-                continue;
-            }
-            let empty = req.preloads.get(i).map(String::is_empty).unwrap_or(true);
-            if empty {
-                preloads.resize(req.args.len(), String::new());
-                preloads[i] = crate::runtime::test_preload_for_snapshot(std::path::Path::new(f), req.snapshot_update).unwrap_or_default();
-            }
-        }
-        req.preloads = preloads;
-    }
+    build_test_preloads(&mut req);
     let n = req.args.len();
     let sequential = std::env::var("HONEY_TEST_SEQUENTIAL").as_deref() == Ok("1");
     let force_workers = std::env::var("HONEY_TEST_WORKERS")
@@ -1048,9 +1141,9 @@ struct TestWorker {
 
 impl TestWorker {
     fn spawn() -> Result<TestWorker, String> {
-        let exe = std::env::current_exe().map_err(|e| format!("failed to locate honey executable: {e}"))?;
+        let exe = daemon_exe().map_err(|e| format!("{e:#}"))?;
         let mut cmd = std::process::Command::new(exe);
-        cmd.args(["--internal-test-worker", "--session"])
+        cmd.args(["worker", "--session"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
@@ -1161,9 +1254,9 @@ fn run_batch_on_worker(request: Request) -> Result<Vec<Response>, String> {
 /// Send one Request to a fresh `--internal-test-worker` subprocess and parse
 /// the TestBatchResponse (chunk of a parallel test run).
 fn run_worker_batch(request: Request) -> Result<Vec<Response>, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("failed to locate honey executable: {e}"))?;
+    let exe = daemon_exe().map_err(|e| format!("{e:#}"))?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--internal-test-worker")
+    cmd.arg("worker")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1269,16 +1362,68 @@ fn fail_response(error: String) -> Response {
     }
 }
 
+/// Turn a captured `Result` into a wire response: stdout/stderr always carry
+/// the captured output, and a failure becomes `error` + exit code 1.
+fn result_response(out: String, err: String, result: anyhow::Result<()>) -> Response {
+    match result {
+        Ok(()) => Response {
+            exit_code: 0,
+            stdout: out,
+            stderr: err,
+            duration_ms: 0.0,
+            error: None,
+            file: None,
+        },
+        Err(e) => Response {
+            exit_code: 1,
+            stdout: out,
+            stderr: err,
+            duration_ms: 0.0,
+            error: Some(format!("{e:#}")),
+            file: None,
+        },
+    }
+}
+
+/// Fill empty test preloads daemon-side: the client sends one entry per file
+/// (or none at all) and the daemon builds the shim wrapper, ESM sniff and
+/// snapshot flag from the file it is about to read anyway. Empty files are
+/// left alone so batches may interleave markers.
+fn build_test_preloads(req: &mut Request) {
+    if req.args.is_empty() {
+        return;
+    }
+    let needs = req
+        .args
+        .iter()
+        .enumerate()
+        .any(|(i, f)| !f.is_empty() && req.preloads.get(i).map(String::is_empty).unwrap_or(true));
+    if !needs {
+        return;
+    }
+    req.preloads.resize(req.args.len(), String::new());
+    for (i, f) in req.args.iter().enumerate() {
+        if f.is_empty() || !req.preloads[i].is_empty() {
+            continue;
+        }
+        req.preloads[i] = crate::runtime::test_preload_for_snapshot(
+            std::path::Path::new(f),
+            req.snapshot_update,
+        )
+        .unwrap_or_default();
+    }
+}
+
 /// Execute one request in a one-shot worker subprocess (fresh engine, own
 /// stdio, so concurrent calls don't interfere). Used for preload (test)
 /// runs by the daemon's connection threads and by the CLI's cold fallback.
 pub fn run_in_worker(request: &Request) -> Response {
-    let exe = match std::env::current_exe() {
+    let exe = match daemon_exe() {
         Ok(e) => e,
-        Err(e) => return fail_response(format!("failed to locate honey executable: {e:#}")),
+        Err(e) => return fail_response(format!("failed to locate honeyd executable: {e:#}")),
     };
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--internal-test-worker")
+    cmd.arg("worker")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1327,7 +1472,7 @@ pub fn serve_test_worker() {
     if std::io::stdin().read_to_end(&mut buf).is_err() {
         std::process::exit(2);
     }
-    let Ok(req) = serde_json::from_slice::<Request>(&buf) else {
+    let Ok(mut req) = serde_json::from_slice::<Request>(&buf) else {
         let _ = std::io::stdout().write_all(
             serde_json::to_vec(&fail_response("test worker: unreadable request".into()))
                 .unwrap_or_default()
@@ -1341,6 +1486,7 @@ pub fn serve_test_worker() {
     // init per worker instead of per file; the engine is fresh, so nothing
     // from the parent process's module state leaks in.
     if req.cmd == "test_batch" && !req.args.is_empty() {
+        build_test_preloads(&mut req);
         let mut results = Vec::with_capacity(req.args.len());
         let mut exit = 0;
         for (i, file) in req.args.iter().enumerate() {
@@ -1395,14 +1541,16 @@ fn serve_test_worker_session() {
     let mut stdout = std::io::stdout().lock();
     loop {
         let Some(bytes) = read_msg(&mut stdin) else { return };
-        let Ok(req) = serde_json::from_slice::<Request>(&bytes) else { return };
+        let Ok(mut req) = serde_json::from_slice::<Request>(&bytes) else { return };
         if req.cmd == "exit" {
             return;
         }
         if req.cmd == "test_batch" {
             // Chunk of files: run sequentially in this worker's one engine,
             // answering with a TestBatchResponse (one Response per file,
-            // request order).
+            // request order). Empty preloads are built here: the client skips
+            // the per-file read entirely.
+            build_test_preloads(&mut req);
             let mut results = Vec::with_capacity(req.args.len());
             for (i, file) in req.args.iter().enumerate() {
                 let preload = req.preloads.get(i).cloned().unwrap_or_default();
@@ -1489,6 +1637,9 @@ fn watch_test_session(stream: &mut UnixStream, request: &Request) {
     let Some(mut watcher) = crate::watch::FileWatcher::new() else {
         return;
     };
+    // Build the shim wrappers here: the client sends only the file list.
+    let mut request = request.clone();
+    build_test_preloads(&mut request);
     let cwd = request.cwd.clone();
     let jobs: Vec<(String, String)> = request
         .args
@@ -1582,10 +1733,17 @@ enum CaptureChunk {
 }
 
 /// Whether this process is the daemon (long-lived, owns the warm engine and
-/// the persistent drainer) rather than a one-shot CLI run.
+/// the persistent drainer) rather than a one-shot CLI/worker run. Set
+/// explicitly by `serve()`; argv sniffing broke once the daemon moved to the
+/// `honeyd serve` syntax.
+static IS_DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn is_daemon() -> bool {
-    static DAEMON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DAEMON.get_or_init(|| std::env::args().any(|a| a == "--internal-daemon"))
+    IS_DAEMON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn mark_daemon() {
+    IS_DAEMON.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Lazily started persistent drainer, daemon-only: sleeps in recv() between
@@ -1884,14 +2042,22 @@ fn pid_file_path() -> PathBuf {
     socket_path().with_extension("pid")
 }
 
-/// Is `pid` a live honey-full daemon? kill(pid,0) says alive-but-maybe-other
+/// Is `pid` a live honeyd daemon? kill(pid,0) says alive-but-maybe-other
 /// program, so also confirm the cmdline.
 fn daemon_pid_alive(pid: u32) -> bool {
     if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
         return false;
     }
     std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
-        .map(|c| c.contains("honey-full") && c.contains("internal-daemon"))
+        .map(|c| {
+            if !c.contains("honeyd") {
+                return false;
+            }
+            // `honeyd serve` (the spawn/service form) or bare `honeyd`
+            // (serve is the default) — never `honeyd start/worker/__cli`.
+            c.contains("serve")
+                || c.split('\0').filter(|s| !s.is_empty()).count() <= 1
+        })
         .unwrap_or(false)
 }
 
@@ -1912,6 +2078,19 @@ fn daemon_stderr_log() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".cache")))
         .map(|d| d.join("honey").join("daemon-crash.log"))
+}
+
+/// The engine/daemon binary: `honeyd`, next to this executable. The library
+/// is linked into `honeyd` itself and the full-fat helpers (`hxney-full`),
+/// so resolve a sibling rather than assuming the current exe is the daemon.
+fn daemon_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("failed to locate honeyd executable")?;
+    let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if name == "honeyd" || name.starts_with("honeyd-") {
+        Ok(exe)
+    } else {
+        Ok(exe.with_file_name("honeyd"))
+    }
 }
 
 fn spawn_daemon() -> Result<()> {
@@ -1966,9 +2145,9 @@ fn spawn_daemon() -> Result<()> {
 }
 
 fn spawn_daemon_locked() -> Result<()> {
-    let exe = std::env::current_exe().context("failed to locate honey executable")?;
+    let exe = daemon_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--internal-daemon")
+    cmd.arg("serve")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     // Keep stderr: a daemon that dies (V8 CHECK abort, Rust panic) must leave
@@ -2416,8 +2595,9 @@ pub fn eval_via_daemon(code: &str) -> Option<Response> {
     request(&req, stream)
 }
 
-/// `honey start`: spawn the daemon and wait until its socket is live.
-/// Returns the child pid and whether a daemon was already running.
+/// `honey start` / `honeyd start`: bring the daemon up (installing and
+/// enabling the user service on first use) and wait until its socket answers.
+/// Returns the daemon pid and whether one was already running.
 pub fn start_daemon() -> Result<(u32, bool)> {
     // If a healthy daemon is already live, don't spawn another.
     if let Some(mut s) = connect() {
@@ -2433,28 +2613,9 @@ pub fn start_daemon() -> Result<(u32, bool)> {
             return Ok((0, true));
         }
     }
-    let exe = std::env::current_exe().context("failed to locate honey executable")?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--internal-daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null());
-    match daemon_stderr_log()
-        .and_then(|f| std::fs::OpenOptions::new().create(true).append(true).open(&f).ok())
-    {
-        Some(file) => {
-            cmd.stderr(std::process::Stdio::from(file));
-        }
-        None => {
-            cmd.stderr(std::process::Stdio::null());
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let _ = cmd.process_group(0);
-    }
-    let child = cmd.spawn().context("failed to spawn honey daemon")?;
-    let pid = child.id();
+    // spawn_daemon handles the first-run service install, single-instance
+    // locking, and the fork itself.
+    spawn_daemon()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Some(mut s) = connect() {
@@ -2464,12 +2625,30 @@ pub fn start_daemon() -> Result<(u32, bool)> {
             )
             .is_some()
             {
+                let pid = std::fs::read_to_string(pid_file_path())
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
                 return Ok((pid, false));
             }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     anyhow::bail!("daemon did not come up within 5s")
+}
+
+/// The live daemon's pid, per the pid file + a cmdline check.
+pub fn running_pid() -> Option<u32> {
+    let pid = std::fs::read_to_string(pid_file_path())
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    if daemon_pid_alive(pid) {
+        Some(pid)
+    } else {
+        None
+    }
 }
 
 /// `honey stop`: ask the daemon to exit and remove its socket.

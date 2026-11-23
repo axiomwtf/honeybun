@@ -111,13 +111,23 @@ return null;
     )
 }
 
-/// Resolve a named script task (`honey run <task>`) from the config: a
-/// `scripts` map whose values are shell commands (strings) or functions of
-/// ctx {args} returning a shell command. Returns the command to execute, or
-/// None when no config, no such task, or the shape is unusable. Task names
-/// are restricted to path-friendly characters so they can never inject into
-/// the generated script.
-pub fn resolve_script(name: &str, args: &[String]) -> Option<String> {
+/// Build the self-contained script that invokes a config hook. Returns None
+/// when there is no config file or it cannot be transpiled. This is the
+/// daemon-side half of `fire()`: the thin `honey` client asks the daemon to
+/// build and evaluate it so it never links oxc or the engine.
+pub fn hook_code(hook: &str, ctx_json: &str) -> Option<String> {
+    if hook.is_empty() {
+        return None;
+    }
+    let path = find_config()?;
+    let transpiled = load_transpiled(&path)?;
+    Some(hook_script(&transpiled, hook, ctx_json))
+}
+
+/// Build the self-contained script that resolves a `scripts.<name>` task.
+/// Task names are restricted to path-friendly characters so they can never
+/// inject into the generated script.
+pub fn script_code(name: &str, args: &[String]) -> Option<String> {
     if name.is_empty()
         || !name
             .chars()
@@ -127,11 +137,16 @@ pub fn resolve_script(name: &str, args: &[String]) -> Option<String> {
     }
     let path = find_config()?;
     let transpiled = load_transpiled(&path)?;
-    let args_json = match serde_json::to_string(&args) {
-        Ok(j) => j,
-        Err(_) => return None,
-    };
-    let code = script_script(&transpiled, name, &args_json);
+    let args_json = serde_json::to_string(args).ok()?;
+    Some(script_script(&transpiled, name, &args_json))
+}
+
+/// Resolve a named script task (`honey run <task>`) from the config: a
+/// `scripts` map whose values are shell commands (strings) or functions of
+/// ctx {args} returning a shell command. Returns the command to execute, or
+/// None when no config, no such task, or the shape is unusable.
+pub fn resolve_script(name: &str, args: &[String]) -> Option<String> {
+    let code = script_code(name, args)?;
     let json = eval_quiet(&code)?;
     // A function that returned a non-string (number, object) is not a
     // runnable command: treat it as no script rather than guessing.

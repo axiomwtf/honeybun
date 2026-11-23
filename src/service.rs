@@ -105,7 +105,7 @@ fn plist_contents(exe: &std::path::Path) -> String {
   <key>ProgramArguments</key>
   <array>
     <string>{exe}</string>
-    <string>--internal-daemon</string>
+    <string>serve</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -133,7 +133,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart={exe} --internal-daemon
+ExecStart={exe} serve
 Restart=on-failure
 RestartSec=1
 # The daemon stops cleanly via `honey stop` and must stay stopped then.
@@ -226,14 +226,20 @@ fn marker_path() -> Option<std::path::PathBuf> {
 fn marker_matches(exe: &std::path::Path) -> bool {
     marker_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| s.trim() == exe.to_string_lossy().trim())
+        .map(|s| {
+            let mut lines = s.lines().map(str::trim);
+            // Second line records the daemon syntax the unit was rendered
+            // with; `--internal-daemon` markers must re-install for `serve`.
+            lines.next() == Some(exe.to_string_lossy().trim()) && lines.next() == Some("serve")
+        })
         .unwrap_or(false)
 }
 
 fn write_marker(exe: &std::path::Path) {
     if let Some(dir) = cache_dir() {
         if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(dir.join("service-marker"), exe.to_string_lossy().as_bytes());
+            let body = format!("{}\nserve\n", exe.to_string_lossy());
+            let _ = std::fs::write(dir.join("service-marker"), body.as_bytes());
         }
     }
 }
@@ -267,7 +273,10 @@ pub fn ensure_first_run() -> bool {
 pub fn cli(uninstall: bool, status_only: bool) -> i32 {
     if status_only {
         let reg = registered();
-        let marker = marker_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let marker = marker_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| s.lines().next().map(str::trim).map(str::to_string))
+            .unwrap_or_default();
         #[cfg(target_os = "macos")]
         let kind = "launchd agent";
         #[cfg(not(target_os = "macos"))]
