@@ -17,10 +17,22 @@
 
 use std::process::Command;
 
+// One reverse-DNS id on every platform; the systemd unit appends its
+// `.service` suffix at use sites.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SERVICE_ID_BASE: &str = "io.github.axiomwtf.honey.daemon";
 #[cfg(target_os = "macos")]
-const SERVICE_ID: &str = "com.honey.daemon";
+const SERVICE_ID: &str = SERVICE_ID_BASE;
 #[cfg(not(target_os = "macos"))]
-const SERVICE_ID: &str = "honey-daemon.service";
+const SERVICE_ID: &str = "io.github.axiomwtf.honey.daemon.service";
+
+/// Pre-rename names: cleaned up on install so an update from an older
+/// honeybun never leaves the old unit enabled alongside (or instead of)
+/// the current one.
+#[cfg(target_os = "macos")]
+const LEGACY_SERVICE_IDS: [&str; 1] = ["com.honey.daemon"];
+#[cfg(not(target_os = "macos"))]
+const LEGACY_SERVICE_IDS: [&str; 1] = ["honey-daemon.service"];
 
 fn env_disabled() -> bool {
     for k in ["HONEY_NO_DAEMON", "HONEY_NO_SERVICE"] {
@@ -156,9 +168,35 @@ fn run_quiet(cmd: &mut Command) -> bool {
     }
 }
 
+/// Best-effort removal of a pre-rename service definition (old id, same
+/// dir): disable/stop it, then delete the file. Silence is the contract.
+fn uninstall_legacy() {
+    for id in LEGACY_SERVICE_IDS {
+        let Some(file) = service_file().map(|f| f.with_file_name(id)) else { return };
+        if !file.exists() {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = run_quiet(Command::new("launchctl").args(["bootout", &format!("gui/{}/{}", node_uid(), id)]));
+            let _ = run_quiet(Command::new("launchctl").args(["unload", "-w"]).arg(&file));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = &file; // unit file removal below; disable ends management
+            if systemd_available() {
+                let _ = run_quiet(Command::new("systemctl").args(["--user", "disable", "--now", id]));
+                let _ = run_quiet(Command::new("systemctl").args(["--user", "daemon-reload"]));
+            }
+        }
+        let _ = std::fs::remove_file(&file);
+    }
+}
+
 /// Write the definition file and enable + start the service.
 /// Returns true if it didn't blow an error when asked to be loud.
 fn install_and_enable() -> bool {
+    uninstall_legacy();
     let Some(dir) = service_dir() else { return false };
     let Ok(exe) = current_exe() else { return false };
     if std::fs::create_dir_all(&dir).is_err() {
@@ -230,7 +268,11 @@ fn marker_matches(exe: &std::path::Path) -> bool {
             let mut lines = s.lines().map(str::trim);
             // Second line records the daemon syntax the unit was rendered
             // with; `--internal-daemon` markers must re-install for `serve`.
-            lines.next() == Some(exe.to_string_lossy().trim()) && lines.next() == Some("serve")
+            // Third line records the service id, so a renamed unit
+            // (honey-daemon.service -> honeyd.service) re-installs too.
+            lines.next() == Some(exe.to_string_lossy().trim())
+                && lines.next() == Some("serve")
+                && lines.next() == Some(SERVICE_ID)
         })
         .unwrap_or(false)
 }
@@ -238,7 +280,7 @@ fn marker_matches(exe: &std::path::Path) -> bool {
 fn write_marker(exe: &std::path::Path) {
     if let Some(dir) = cache_dir() {
         if std::fs::create_dir_all(&dir).is_ok() {
-            let body = format!("{}\nserve\n", exe.to_string_lossy());
+            let body = format!("{}\nserve\n{}\n", exe.to_string_lossy(), SERVICE_ID);
             let _ = std::fs::write(dir.join("service-marker"), body.as_bytes());
         }
     }
